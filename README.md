@@ -14,7 +14,7 @@ High Recall - >90% recall at 50x+ speedup
 CPU Optimized - No GPU required
 📦 Installation
 # Clone repository
-git clone https://github.com/brianschw/m2m-gaussian-splatting.git
+git clone https://github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting.git
 cd m2m-gaussian-splatting
 
 # Install dependencies
@@ -49,10 +49,10 @@ Splats	Build (s)	Linear (ms)	HRM2 (ms)	Speedup	Recall
 🔧 Architecture
 Embedding (640D)
 ┌────────────────────────────────────────────────────────┐
-│                    640D Embedding                       │
+│                    640D Embedding                      │
 ├────────────────────────────────────────────────────────┤
-│  Position (64D)  │  Color (512D)  │  Attributes (64D) │
-│  Sinusoidal PE   │  Histogram     │  Opacity/Scale    │
+│  Position (64D)  │  Color (512D)  │  Attributes (64D)  │
+│  Sinusoidal PE   │  Histogram     │  Opacity/Scale     │
 └────────────────────────────────────────────────────────┘
 HRM2 Index
 Query Vector
