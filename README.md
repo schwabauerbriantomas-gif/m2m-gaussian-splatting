@@ -76,10 +76,10 @@ Benchmarks on ryzen 5 3400g (640D embeddings, k=10):
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│                    640D Embedding                       │
+│                    640D Embedding                      │
 ├────────────────────────────────────────────────────────┤
-│  Position (64D)  │  Color (512D)  │  Attributes (64D) │
-│  Sinusoidal PE   │  Histogram     │  Opacity/Scale    │
+│  Position (64D)  │  Color (512D)  │  Attributes (64D)  │
+│  Sinusoidal PE   │  Histogram     │  Opacity/Scale     │
 └────────────────────────────────────────────────────────┘
 ```
 
