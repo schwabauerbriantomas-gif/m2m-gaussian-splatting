@@ -60,7 +60,7 @@ for splat, distance in results:
 
 ## 📊 Performance
 
-Benchmarks on Intel i7 (640D embeddings, k=10):
+Benchmarks on ryzen 5 3400g (640D embeddings, k=10):
 
 | Splats | Build (s) | Linear (ms) | HRM2 (ms) | Speedup | Recall |
 |--------|-----------|-------------|-----------|---------|--------|
