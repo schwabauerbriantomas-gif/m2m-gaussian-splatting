@@ -1,7 +1,6 @@
 # M2M Gaussian Splatting
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 **Hierarchical Retrieval and Memory Management for 3D Gaussian Splatting**
@@ -25,7 +24,7 @@ M2M Gaussian Splatting provides fast similarity search and efficient memory mana
 
 ```bash
 # Clone repository
-git clone https://github.com/brianschw/m2m-gaussian-splatting.git
+git clone https://github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting.git
 cd m2m-gaussian-splatting
 
 # Install dependencies
@@ -281,9 +280,9 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## 📧 Contact
 
-Brian Schwabauer - [@brianschw](https://twitter.com/brianschw)
+Brian Schwabauer - Scwhabauerbriantomas@gmail.com
 
-Project: [github.com/brianschw/m2m-gaussian-splatting](https://github.com/brianschw/m2m-gaussian-splatting)
+Project: https://github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting
 
 ---
 
