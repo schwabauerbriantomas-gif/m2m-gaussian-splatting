@@ -181,9 +181,9 @@ MIT License - see LICENSE for details.
 Numba - JIT compilation
 scikit-learn - Reference implementations
 📧 Contact
-Brian Schwabauer - @brianschw
+Brian Schwabauer - schwabauerbriantomas@gmail.com
 
-Project: github.com/brianschw/m2m-gaussian-splatting
+Project: github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting
 
 🔖 Keywords
 gaussian-splatting 3dgs hierarchical-retrieval vector-search numba kmeans similarity-search point-cloud 3d-reconstruction nerf embedding cpu-optimized memory-management hrm2 clustering jit-compilation python
