@@ -103,12 +103,13 @@ class SinusoidalPositionEncoder:
     def __init__(self, dim: int = 64):
         """
         Initialize encoder.
-        
+
         Args:
-            dim: Output dimension (will be adjusted to be divisible by 6)
+            dim: Output dimension. Uses dim//6 frequencies of (sin,cos) per axis
+                 (x,y,z), filling dim//6*6 columns. Remaining columns are zero-padded
+                 so the output is exactly ``dim`` dimensions.
         """
-        # Ensure dim is divisible by 6 (for x, y, z sin/cos)
-        self.dim = (dim // 6) * 6
+        self.dim = dim
         if self.dim < 6:
             self.dim = 6
     
@@ -154,32 +155,35 @@ def _color_histogram_encoding_numba(
     """
     N = colors.shape[0]
     n_bins_cubed = n_bins * n_bins * n_bins  # 512 for n_bins=8
-    encodings = np.zeros((N, 512), dtype=np.float32)
-    
+    encodings = np.zeros((N, n_bins_cubed), dtype=np.float32)
+
+    # Only evaluate bins within radius 2 of the target — Gaussian kernel
+    # decays as exp(-d²/4), so contributions beyond d=2 are negligible (<0.37).
+    # This reduces from O(n_bins³) to O(5³)=125 iterations per splat.
+    neighborhood = []
+    for dr in range(-2, 3):
+        for dg in range(-2, 3):
+            for db in range(-2, 3):
+                neighborhood.append((dr, dg, db))
+
     for i in prange(N):
         r, g, b = colors[i]
-        
+
         # Quantize to bins
         bin_r = min(int(r * n_bins), n_bins - 1)
         bin_g = min(int(g * n_bins), n_bins - 1)
         bin_b = min(int(b * n_bins), n_bins - 1)
-        
-        # Create histogram with Gaussian smoothing
-        idx = 0
-        for br in range(n_bins):
-            for bg in range(n_bins):
-                for bb in range(n_bins):
-                    dr = float(br - bin_r)
-                    dg = float(bg - bin_g)
-                    db = float(bb - bin_b)
-                    
-                    # Gaussian kernel
-                    dist_sq = dr*dr + dg*dg + db*db
-                    weight = np.exp(-dist_sq / 4.0)
-                    
-                    if idx < 512:
-                        encodings[i, idx] = weight
-                    idx += 1
+
+        for dr, dg, db in neighborhood:
+            br = bin_r + dr
+            bg = bin_g + dg
+            bb = bin_b + db
+            if br < 0 or br >= n_bins or bg < 0 or bg >= n_bins or bb < 0 or bb >= n_bins:
+                continue
+            dist_sq = dr*dr + dg*dg + db*db
+            weight = np.exp(-dist_sq / 4.0)
+            idx = (br * n_bins + bg) * n_bins + bb
+            encodings[i, idx] = weight
     
     return encodings
 

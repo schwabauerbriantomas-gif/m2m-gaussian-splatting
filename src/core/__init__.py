@@ -10,7 +10,7 @@ from .encoding import (
     FullEmbeddingBuilder,
 )
 from .clustering import KMeansJIT
-from .hrm2_engine import HRM2Engine
+from .hrm2_engine import HRM2Engine, generate_test_splats
 
 __all__ = [
     "GaussianSplat",
@@ -21,4 +21,5 @@ __all__ = [
     "FullEmbeddingBuilder",
     "KMeansJIT",
     "HRM2Engine",
+    "generate_test_splats",
 ]

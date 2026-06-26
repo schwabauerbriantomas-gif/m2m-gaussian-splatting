@@ -33,48 +33,57 @@ def kmeans_plusplus_init(
 ) -> np.ndarray:
     """
     KMeans++ initialization for better centroid selection.
-    
+
+    Uses a running minimum-distance array so each new centroid only
+    needs O(N·D) work instead of recomputing all distances from scratch.
+    Total complexity: O(N·K·D) instead of O(N·K²·D).
+
     Args:
         data: (N, D) array of data points
         n_clusters: Number of clusters
         random_state: Random seed
-    
+
     Returns:
         (n_clusters, D) array of initial centroids
     """
     np.random.seed(random_state)
     N, D = data.shape
     centroids = np.zeros((n_clusters, D), dtype=np.float32)
-    
+
     # Choose first centroid randomly
     idx = np.random.randint(0, N)
     centroids[0] = data[idx]
-    
-    # Choose remaining centroids with probability proportional to distance squared
+
+    # Running minimum squared distance to nearest selected centroid
+    min_dist_sq = np.full(N, np.inf, dtype=np.float32)
+    for i in range(N):
+        dist = 0.0
+        for d in range(D):
+            diff = data[i, d] - centroids[0, d]
+            dist += diff * diff
+        min_dist_sq[i] = dist
+
+    # Choose remaining centroids
     for k in range(1, n_clusters):
-        # Compute distances to nearest centroid
-        distances = np.full(N, np.inf, dtype=np.float32)
-        
-        for i in range(N):
-            for j in range(k):
-                dist = 0.0
-                for d in range(D):
-                    diff = data[i, d] - centroids[j, d]
-                    dist += diff * diff
-                if dist < distances[i]:
-                    distances[i] = dist
-        
         # Sample proportional to distance squared
-        total = np.sum(distances) + 1e-10
-        probs = distances / total
+        total = np.sum(min_dist_sq) + 1e-10
+        probs = min_dist_sq / total
         cumprobs = np.cumsum(probs)
-        
+
         r = np.random.random()
         idx = np.searchsorted(cumprobs, r)
         idx = min(idx, N - 1)
-        
         centroids[k] = data[idx]
-    
+
+        # Update min_dist_sq: only compare against the new centroid
+        for i in range(N):
+            dist = 0.0
+            for d in range(D):
+                diff = data[i, d] - centroids[k, d]
+                dist += diff * diff
+            if dist < min_dist_sq[i]:
+                min_dist_sq[i] = dist
+
     return centroids
 
 
@@ -166,15 +175,15 @@ def mini_batch_kmeans(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Mini-batch KMeans for large datasets.
-    
+
     More efficient than standard KMeans for large N.
-    
+
     Args:
         data: (N, D) array
         initial_centroids: (K, D) initial centroids
         batch_size: Mini-batch size
         max_iter: Maximum iterations
-    
+
     Returns:
         Tuple of (centroids, labels)
     """
@@ -182,28 +191,28 @@ def mini_batch_kmeans(
     N, D = data.shape
     K = centroids.shape[0]
     counts = np.ones(K, dtype=np.float32)
-    
+
     for iteration in range(max_iter):
-        # Sample mini-batch
+        # Sample mini-batch (Numba-compatible: use permutation instead of choice)
         n_samples = min(batch_size, N)
-        indices = np.random.choice(N, n_samples, replace=False)
-        batch = data[indices]
-        
+        perm = np.random.permutation(N)
+        batch = data[perm[:n_samples]]
+
         # Assign batch points
         batch_labels = assign_clusters(batch, centroids)
-        
+
         # Update centroids with learning rate
-        for i in range(len(batch)):
+        for i in range(n_samples):
             k = batch_labels[i]
             counts[k] += 1
             eta = 1.0 / counts[k]
-            
+
             for d in range(D):
                 centroids[k, d] = (1.0 - eta) * centroids[k, d] + eta * batch[i, d]
-    
+
     # Final assignment
     labels = assign_clusters(data, centroids)
-    
+
     return centroids, labels
 
 
@@ -388,35 +397,26 @@ class KMeans:
     def transform(self, data: np.ndarray) -> np.ndarray:
         """
         Transform data to cluster-distance space.
-        
+
         Args:
             data: (N, D) array
-        
+
         Returns:
             (N, n_clusters) array of distances
         """
         if self.centroids_ is None:
             raise RuntimeError("Must call fit() before transform()")
-        
+
         data = np.ascontiguousarray(data.astype(np.float32))
         if data.ndim == 1:
             data = data.reshape(-1, 1)
-        
-        N = data.shape[0]
-        K = self.n_clusters
-        D = data.shape[1]
-        
-        distances = np.zeros((N, K), dtype=np.float32)
-        
-        for i in range(N):
-            for k in range(K):
-                dist = 0.0
-                for d in range(D):
-                    diff = data[i, d] - self.centroids_[k, d]
-                    dist += diff * diff
-                distances[i, k] = np.sqrt(dist)
-        
-        return distances
+
+        # Vectorized: ||data - centroid||² = ||data||² + ||centroid||² - 2·data·centroidᵀ
+        data_norms = np.sum(data ** 2, axis=1, keepdims=True)     # (N, 1)
+        cent_norms = np.sum(self.centroids_ ** 2, axis=1)         # (K,)
+        cross = data @ self.centroids_.T                           # (N, K)
+        dist_sq = data_norms + cent_norms - 2.0 * cross
+        return np.sqrt(np.maximum(dist_sq, 0.0))
 
 
 # Alias for backward compatibility

@@ -48,9 +48,9 @@ engine = HRM2Engine(n_coarse=50, n_fine=200)
 engine.add_splats(splats)
 engine.index()
 
-# Query for similar splats
-query = splats[0]  # Use first splat as query
-results = engine.query(query.vector, k=10)
+# Query for similar splats (use the engine's embeddings)
+query = engine.embeddings[0]  # Use first splat's embedding
+results = engine.query(query, k=10)
 
 for splat, distance in results:
     print(f"Splat {splat.id}: distance={distance:.4f}")
@@ -228,11 +228,12 @@ splat = memory.get_splat(splat_id)
 ## 🔬 Technical Details
 
 ### Position Encoding (64D)
-Sinusoidal encoding similar to Transformers:
+NeRF-style multi-frequency sinusoidal encoding:
 ```
-PE(x, 2i) = sin(x / 10000^(2i/dim))
-PE(x, 2i+1) = cos(x / 10000^(2i/dim))
+PE(x, 2i)   = sin(x_norm * 2^i)
+PE(x, 2i+1) = cos(x_norm * 2^i)
 ```
+where `x_norm` is the coordinate normalized to [0, 1].
 
 
 ### Color Encoding (512D)
@@ -280,7 +281,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## 📧 Contact
 
-Brian Schwabauer - Scwhabauerbriantomas@gmail.com
+Brian Schwabauer - schwabauerbriantomas@gmail.com
 
 Project: https://github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting
 

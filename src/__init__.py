@@ -5,7 +5,7 @@ A hierarchical memory management system for 3D Gaussian Splatting
 with optimized encoding and clustering algorithms.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Brian Schwabauer"
 
 from .core.splat_types import GaussianSplat, SplatEmbedding
