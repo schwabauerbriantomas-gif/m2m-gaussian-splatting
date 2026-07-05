@@ -65,9 +65,7 @@ class GPUSearcher:
     def is_gpu(self) -> bool:
         return self._device == "cuda"
 
-    def search(
-        self, query: np.ndarray, k: int = 10
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def search(self, query: np.ndarray, k: int = 10) -> Tuple[np.ndarray, np.ndarray]:
         """
         Single-query search.
 
@@ -78,9 +76,7 @@ class GPUSearcher:
         indices, distances = self.batch_search(q.reshape(1, -1), k)
         return indices[0], distances[0]
 
-    def batch_search(
-        self, queries: np.ndarray, k: int = 10
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def batch_search(self, queries: np.ndarray, k: int = 10) -> Tuple[np.ndarray, np.ndarray]:
         """
         Batch search.
 
@@ -103,9 +99,7 @@ class GPUSearcher:
 
     # ---- GPU path ----------------------------------------------------
 
-    def _batch_gpu(
-        self, queries: np.ndarray, k: int
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def _batch_gpu(self, queries: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         device = torch.device(self._device)
         q_t = torch.from_numpy(queries).to(device)
         B = q_t.shape[0]
@@ -133,9 +127,7 @@ class GPUSearcher:
 
     # ---- CPU path ----------------------------------------------------
 
-    def _batch_cpu(
-        self, queries: np.ndarray, k: int
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def _batch_cpu(self, queries: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         q_sq = np.sum(queries**2, axis=1, keepdims=True)  # (B,1)
         cross = queries @ self._index_np.T  # (B,N)
         dist_sq = q_sq + self._norms_np - 2.0 * cross

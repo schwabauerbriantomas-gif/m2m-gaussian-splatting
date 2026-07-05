@@ -1,184 +1,206 @@
 # M2M Gaussian Splatting
 
+[![CI](https://github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting/actions/workflows/ci.yml/badge.svg)](https://github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/m2m-gaussian-splatting.svg)](https://pypi.org/project/m2m-gaussian-splatting/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-**Hierarchical Retrieval and Memory Management for 3D Gaussian Splatting**
-
-M2M Gaussian Splatting provides fast similarity search and efficient memory management for large-scale 3D Gaussian splat datasets. Optimized for CPU with Numba JIT compilation.
+**Hierarchical retrieval and memory management for 3D Gaussian Splatting, with GPU acceleration (CUDA/PyTorch) and CPU fallback (Numba JIT).**
 
 ---
 
-## ✨ Features
+## Overview
 
-- **Hierarchical Indexing (HRM2)** - Two-level clustering for fast retrieval
-- **640D Embeddings** - Position, color, and attribute encodings
-- **Numba JIT Acceleration** - 5-10x speedup over pure Python
-- **Memory Management** - Three-tier memory (VRAM/RAM/Disk)
-- **High Recall** - >90% recall at 50x+ speedup
-- **CPU Optimized** - No GPU required
+M2M Gaussian Splatting converts 3D Gaussian splats into 640-dimensional embeddings and indexes them using a two-level hierarchical clustering (HRM2) for fast approximate nearest neighbor search. It automatically uses CUDA when available and falls back to CPU.
+
+**Key components:**
+
+- **640D embeddings** — position (64D sinusoidal), color (512D histogram), attributes (64D)
+- **HRM2 Engine** — two-level K-Means index (coarse + fine) with IVF-style candidate pruning
+- **GPU search** — brute-force L2 k-NN on CUDA via PyTorch `torch.topk`, auto-detected
+- **Memory manager** — three-tier LRU cache (VRAM → RAM → cold) with thread-safe eviction
 
 ---
 
-## 📦 Installation
+## Installation
 
 ```bash
-# Clone repository
-git clone https://github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting.git
-cd m2m-gaussian-splatting
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Or with pip
-pip install numpy numba scipy scikit-learn
+pip install m2m-gaussian-splatting
 ```
 
+**With GPU support (optional):**
 
-## 🚀 Quick Start
+```bash
+pip install m2m-gaussian-splatting[gpu]
+```
+
+This installs PyTorch with CUDA. The library works on CPU alone (`numpy` + `numba`); GPU is optional and auto-detected at runtime.
+
+**From source:**
+
+```bash
+git clone https://github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting.git
+cd m2m-gaussian-splatting
+pip install -e ".[dev]"
+```
+
+---
+
+## Quick Start
 
 ```python
-from src.core import GaussianSplat, HRM2Engine, generate_test_splats
+from m2m_gaussian_splatting import HRM2Engine, generate_test_splats
 
-# Generate test data
+# Generate synthetic test data
 splats = generate_test_splats(n_splats=10000)
 
-# Create and index
-engine = HRM2Engine(n_coarse=50, n_fine=200)
+# Build index (auto-detects CUDA, falls back to CPU)
+engine = HRM2Engine(n_coarse=50, n_fine=200, use_gpu=True)
 engine.add_splats(splats)
 engine.index()
 
-# Query for similar splats (use the engine's embeddings)
-query = engine.embeddings[0]  # Use first splat's embedding
+# Query for similar splats
+query = engine.embeddings[0]
 results = engine.query(query, k=10)
 
 for splat, distance in results:
     print(f"Splat {splat.id}: distance={distance:.4f}")
+
+print(f"Device: {engine.get_stats().device}")  # "cuda" or "cpu"
 ```
 
 ---
 
-## 📊 Performance
+## Performance
 
-Benchmarks on ryzen 5 3400g (640D embeddings, k=10):
+**Benchmark environment:** AMD Ryzen 5 3400G, NVIDIA RTX 3090 (24GB), Python 3.12, PyTorch 2.6 + CUDA 12.4. 640D embeddings, k=10, 50 queries, p50 latency.
 
-| Splats | Build (s) | Linear (ms) | HRM2 (ms) | Speedup | Recall |
-|--------|-----------|-------------|-----------|---------|--------|
-| 10,000 | 1.2 | 12.5 | 0.8 | 15x | 95% |
-| 50,000 | 5.8 | 62.0 | 1.5 | 41x | 93% |
-| 100,000 | 12.0 | 125.0 | 2.2 | 57x | 91% |
+| Splats | CPU p50 | GPU p50 | Speedup | CPU Build | GPU Build | GPU QPS |
+|--------|---------|---------|---------|-----------|-----------|---------|
+| 1,000 | 0.89 ms | 0.91 ms | 1.0x | 1.5 s | 1.5 s | 981 |
+| 10,000 | 8.22 ms | 1.12 ms | **7.3x** | 28.0 s | 2.1 s | 831 |
+| 50,000 | 49.76 ms | 3.64 ms | **13.7x** | 156.7 s | 7.4 s | 236 |
+
+GPU brute-force search dominates at scale: single-tensor upload, batched `torch.topk`, no clustering overhead. CPU uses the hierarchical IVF path with Numba-JIT K-Means.
+
+> These results are measured locally with `scripts/benchmark_gpu.py`. Raw JSON: `benchmark_results.json`.
 
 ---
 
-## 🔧 Architecture
+## Architecture
 
-### Embedding (640D)
-
-```
-┌────────────────────────────────────────────────────────┐
-│                    640D Embedding                      │
-├────────────────────────────────────────────────────────┤
-│  Position (64D)  │  Color (512D)  │  Attributes (64D)  │
-│  Sinusoidal PE   │  Histogram     │  Opacity/Scale     │
-└────────────────────────────────────────────────────────┘
-```
-
-### HRM2 Index
+### Embedding Pipeline (640D)
 
 ```
-Query Vector
-     │
-     ▼
-┌──────────────────┐
-│ Level 1: Coarse  │  ← K-Means (100 clusters)
-│ Find nearest     │
-└──────────────────┘
-     │
-     ▼
-┌──────────────────┐
-│ Level 2: Fine    │  ← K-Means (1000 clusters)
-│ Search within    │
-└──────────────────┘
-     │
-     ▼
+┌──────────────────────────────────────────────────────────┐
+│                    640D Embedding                         │
+├────────────────┬──────────────────┬───────────────────────┤
+│ Position (64D) │  Color (512D)    │  Attributes (64D)     │
+│ Sinusoidal PE  │  Histogram +     │  Opacity, Scale,      │
+│ (NeRF-style)   │  Gaussian smooth │  Rotation features    │
+└────────────────┴──────────────────┴───────────────────────┘
+```
+
+### HRM2 Two-Level Index (CPU path)
+
+```
+Query Vector (640D)
+    │
+    ▼
+┌──────────────────────┐
+│ Level 1: Coarse      │  K-Means (n_coarse clusters)
+│ Find n_probe nearest │  Gram-matrix L2: ||q||² + ||c||² - 2·q·c
+└──────────────────────┘
+    │
+    ▼
+┌──────────────────────┐
+│ Level 2: Candidates  │  Gather splats from probed clusters
+│ Rank by L2 distance  │  argpartition top-k (O(N) not O(N log N))
+└──────────────────────┘
+    │
+    ▼
   Top-K Results
 ```
 
+### GPU Path
+
+```
+Query Batch (B × 640D)
+    │
+    ▼
+┌──────────────────────────────┐
+│ GPU Brute-Force L2           │  torch.matmul: B×N distance matrix
+│ Gram trick on CUDA tensors   │  ||q||² + ||m||² - 2·q·mᵀ
+└──────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────┐
+│ torch.topk                   │  Batched top-k selection on GPU
+│ Sorted distances + indices   │  Chunked by max_batch_size
+└──────────────────────────────┘
+    │
+    ▼
+  Top-K Results per query
+```
+
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 m2m-gaussian-splatting/
 ├── src/
 │   ├── core/
-│   │   ├── splat_types.py     # Data structures
-│   │   ├── encoding.py        # Numba JIT encoders
-│   │   ├── clustering.py      # K-Means implementation
-│   │   └── hrm2_engine.py     # Hierarchical retrieval
+│   │   ├── splat_types.py       # GaussianSplat, SplatEmbedding dataclasses
+│   │   ├── encoding.py          # Numba JIT encoders (position, color, attribute)
+│   │   ├── clustering.py        # K-Means++ + Mini-batch (Numba)
+│   │   └── hrm2_engine.py       # HRM2 hierarchical index + GPU dispatch
+│   ├── gpu/
+│   │   ├── backend.py           # CUDA detection, device info
+│   │   ├── gpu_kmeans.py        # GPU K-Means via PyTorch tensors
+│   │   └── gpu_search.py        # GPU brute-force k-NN search
 │   └── memory/
-│       └── manager.py         # Memory tiers
-├── scripts/
-│   ├── quick_demo.py          # Getting started
-│   └── run_benchmarks.py      # Performance tests
+│       └── manager.py           # Three-tier LRU memory (thread-safe)
 ├── tests/
-│   └── test_*.py
+│   └── test_core.py             # 36 tests (CPU + GPU + regression)
+├── scripts/
+│   ├── quick_demo.py            # Interactive demo
+│   ├── run_benchmarks.py        # CPU HRM2 vs linear
+│   └── benchmark_gpu.py         # GPU vs CPU comparison
 ├── docs/
-│   └── ARCHITECTURE.md
-├── requirements.txt
+│   └── ARCHITECTURE.md          # Architecture document
+├── benchmark_results.json       # Measured results
+├── pyproject.toml
 └── README.md
 ```
 
 ---
 
-## 🎯 Use Cases
+## API Reference
 
-### 3D Scene Retrieval
-Find similar regions in large 3D scans.
-
-```python
-# Find similar scene regions
-results = engine.query(region_embedding, k=20)
-```
-
-
-### Asset Search
-Search through millions of 3D assets.
+### HRM2Engine
 
 ```python
-# Find assets with similar appearance
-similar = engine.query(asset_embedding, k=10)
+engine = HRM2Engine(
+    n_coarse=100,     # Coarse clusters
+    n_fine=1000,      # Fine clusters per coarse
+    n_probe=5,        # Clusters to probe at query time
+    use_gpu=True,     # Auto-detect CUDA (default), set False to force CPU
+)
+
+engine.add_splats(splats)
+engine.index()
+
+# Single query → List[(GaussianSplat, distance)]
+results = engine.query(query_vector, k=10)
+
+# Batch query (GPU-parallelized when available)
+results = engine.batch_query(query_batch, k=10)
+
+# Detailed results with cluster IDs
+details = engine.query_with_details(query_vector, k=10)  # → List[SearchResult]
 ```
-
-
-### Point Cloud Processing
-Efficient queries on LiDAR data.
-
-```python
-# Find points matching a pattern
-matches = engine.query(pattern_embedding, k=100)
-```
-
-
----
-
-## 🧪 Running Tests
-
-```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Run with coverage
-python -m pytest tests/ --cov=src
-
-# Run benchmarks
-python scripts/run_benchmarks.py
-```
-
-
----
-
-## 📖 API Reference
 
 ### GaussianSplat
 
@@ -186,107 +208,99 @@ python scripts/run_benchmarks.py
 splat = GaussianSplat(
     id=0,
     position=[x, y, z],        # 3D position
-    color=[r, g, b],           # RGB color
-    opacity=0.9,               # Transparency
-    scale=[sx, sy, sz],        # Scale factors
-    rotation=[w, x, y, z]      # Quaternion
+    color=[r, g, b],           # RGB color [0,1] or [0,255]
+    opacity=0.9,               # Transparency [0,1]
+    scale=[sx, sy, sz],        # Ellipsoid scale factors
+    rotation=[w, x, y, z],     # Quaternion (auto-normalized)
 )
 ```
-
-
-### HRM2Engine
-
-```python
-engine = HRM2Engine(
-    n_coarse=100,    # Coarse clusters
-    n_fine=1000,     # Fine clusters
-    n_probe=5,       # Clusters to search
-)
-
-engine.add_splats(splats)
-engine.index()
-
-results = engine.query(query_vector, k=10)
-```
-
 
 ### SplatMemoryManager
 
 ```python
 memory = SplatMemoryManager(
-    vram_limit=100000,   # Hot tier
-    ram_limit=1000000,   # Warm tier
+    vram_limit=100000,         # Hot tier (max splats)
+    ram_limit=1000000,         # Warm tier
+    eviction_threshold=0.8,    # Evict at 80% capacity
+    access_threshold=10,       # Promote to VRAM after N accesses
 )
 
 memory.add_splats(splats)
-splat = memory.get_splat(splat_id)
+splat = memory.get_splat(splat_id)  # Thread-safe, auto-promotes
 ```
-
 
 ---
 
-## 🔬 Technical Details
+## Use Cases
+
+- **3D scene retrieval** — find similar regions in large-scale 3D scans or reconstructions
+- **Asset search** — query through millions of 3D Gaussian splats by appearance similarity
+- **Point cloud processing** — efficient k-NN on LiDAR and photogrammetry data
+- **Memory-tiered caching** — hot/warm/cold splat storage with LRU eviction for VRAM-constrained rendering
+
+---
+
+## Testing
+
+```bash
+# Run full test suite (36 tests)
+python -m pytest tests/ -v
+
+# With coverage
+python -m pytest tests/ --cov=src
+
+# Run benchmarks
+python scripts/benchmark_gpu.py    # GPU vs CPU
+python scripts/run_benchmarks.py   # HRM2 vs linear
+```
+
+Tests cover: GPU recall against CPU ground truth, K-Means convergence, encoding edge cases (dim truncation, color normalization), thread safety (8-thread concurrent access), LRU eviction, serialization, and global RNG isolation.
+
+---
+
+## Technical Details
 
 ### Position Encoding (64D)
-NeRF-style multi-frequency sinusoidal encoding:
-```
-PE(x, 2i)   = sin(x_norm * 2^i)
-PE(x, 2i+1) = cos(x_norm * 2^i)
-```
-where `x_norm` is the coordinate normalized to [0, 1].
 
+NeRF-style multi-frequency sinusoidal encoding applied per-axis (x, y, z):
+
+```
+PE(axis, freq_i) = [sin(axis_norm · 2^i), cos(axis_norm · 2^i)]
+```
+
+where `axis_norm` normalizes each coordinate to [0, 1] using dataset min/max. Output is `n_freq × 6` columns (sin/cos for x, y, z per frequency), zero-padded to exactly 64D.
 
 ### Color Encoding (512D)
-Histogram-based with Gaussian smoothing:
-- 8 bins per channel
-- 8³ = 512 total dimensions
-- Smoothed with Gaussian kernel
 
+Histogram-based with Gaussian kernel smoothing:
 
-### K-Means Implementation
-- K-Means++ initialization
-- Numba JIT for speed
-- Parallel distance computation
+- 8 bins per RGB channel → 8³ = 512 total dimensions
+- Only evaluates bins within radius 2 of the target (125 vs 512 iterations per splat)
+- Gaussian kernel `exp(-d²/4)` decays below 0.37 at d=2
 
+### K-Means
 
----
-
-## 🤝 Contributing
-
-Contributions welcome! Please:
-
-1. Fork the repository
-2. Create feature branch (`git checkout -b feature/amazing`)
-
-
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing`)
-5. Open a Pull Request
+- **K-Means++ initialization** with running min-distance array (O(N·K·D), not O(N·K²·D))
+- **Mini-batch updates** with learning-rate decay `η = 1/count`
+- Numba `@njit(fastmath=True)` on CPU, PyTorch CUDA on GPU
+- OOM recovery: GPU init falls back to CPU automatically
 
 ---
 
-## 📄 License
+## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
----
-
-## 🙏 Acknowledgments
-
-- [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) - Kerbl et al.
-- [Numba](https://numba.pydata.org/) - JIT compilation
-- [scikit-learn](https://scikit-learn.org/) - Reference implementations
+Apache License 2.0 — see [LICENSE](LICENSE).
 
 ---
 
-## 📧 Contact
+## Author
 
-Brian Schwabauer - schwabauerbriantomas@gmail.com
+Brian Schwabauer — schwabauerbriantomas@gmail.com
 
 Project: https://github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting
 
 ---
 
-## 🔖 Keywords
+## Keywords
 
-`gaussian-splatting` `3dgs` `hierarchical-retrieval` `vector-search` `numba` `kmeans` `similarity-search` `point-cloud` `3d-reconstruction` `nerf` `embedding` `cpu-optimized` `memory-management` `hrm2` `clustering` `jit-compilation` `python`
+`gaussian-splatting` `3dgs` `hierarchical-retrieval` `vector-search` `numba` `kmeans` `similarity-search` `point-cloud` `embedding` `cpu-optimized` `gpu` `cuda` `pytorch` `memory-management` `hrm2` `clustering` `jit-compilation`

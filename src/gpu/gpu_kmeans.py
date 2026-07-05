@@ -209,9 +209,7 @@ class TorchKMeans:
         return centroids
 
     @staticmethod
-    def _kpp_init_cpu(
-        data: np.ndarray, k: int, rng: np.random.RandomState
-    ) -> np.ndarray:
+    def _kpp_init_cpu(data: np.ndarray, k: int, rng: np.random.RandomState) -> np.ndarray:
         """K-Means++ init on CPU with running min-distance."""
         N, D = data.shape
         centroids = np.zeros((k, D), dtype=np.float32)
@@ -234,9 +232,7 @@ class TorchKMeans:
         return centroids
 
     @staticmethod
-    def _assign_batch(
-        data: np.ndarray, centroids: np.ndarray
-    ) -> np.ndarray:
+    def _assign_batch(data: np.ndarray, centroids: np.ndarray) -> np.ndarray:
         """Assign points to nearest centroid (vectorized NumPy)."""
         data_norms = np.sum(data**2, axis=1, keepdims=True)  # (N,1)
         cent_norms = np.sum(centroids**2, axis=1)  # (K,)

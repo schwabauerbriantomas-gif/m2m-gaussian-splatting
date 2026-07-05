@@ -40,6 +40,7 @@ except ImportError:
 @dataclass
 class SearchResult:
     """Result of a similarity search."""
+
     splat_id: int
     distance: float
     coarse_cluster: int
@@ -49,6 +50,7 @@ class SearchResult:
 @dataclass
 class HRM2Config:
     """Configuration for HRM2 Engine."""
+
     n_coarse: int = 100
     n_fine: int = 1000
     embedding_dim: int = 640
@@ -61,6 +63,7 @@ class HRM2Config:
 @dataclass
 class HRM2Stats:
     """Statistics for HRM2 Engine."""
+
     n_splats: int = 0
     n_coarse_clusters: int = 0
     n_fine_clusters: int = 0
@@ -144,14 +147,10 @@ class HRM2Engine:
             cluster_idxs = self._cluster_indices[cid]
             if len(cluster_idxs) < 2:
                 self.fine_models[cid] = None
-                self.fine_assignments[cid] = np.zeros(
-                    len(cluster_idxs), dtype=np.int32
-                )
+                self.fine_assignments[cid] = np.zeros(len(cluster_idxs), dtype=np.int32)
                 continue
 
-            cluster_emb = np.ascontiguousarray(
-                self.embeddings[cluster_idxs].astype(np.float32)
-            )
+            cluster_emb = np.ascontiguousarray(self.embeddings[cluster_idxs].astype(np.float32))
             n_fine = max(1, min(self.n_fine, len(cluster_idxs) // 5))
 
             fm = KMeans(
@@ -199,9 +198,7 @@ class HRM2Engine:
             scales[i] = s.scale
             rotations[i] = s.rotation
 
-        self.embeddings = self.encoder.build(
-            positions, colors, opacities, scales, rotations
-        )
+        self.embeddings = self.encoder.build(positions, colors, opacities, scales, rotations)
         self.embeddings = np.ascontiguousarray(self.embeddings.astype(np.float32))
         self.embedding_dim = self.embeddings.shape[1]
         self._emb_norms_sq = np.sum(self.embeddings**2, axis=1)
@@ -258,9 +255,11 @@ class HRM2Engine:
 
         self._stats.n_splats = n_samples
         self._stats.n_coarse_clusters = n_coarse
-        self._stats.n_fine_clusters = sum(
-            m.n_clusters if m else 0 for m in self.fine_models.values()
-        ) if self.fine_models else 0
+        self._stats.n_fine_clusters = (
+            sum(m.n_clusters if m else 0 for m in self.fine_models.values())
+            if self.fine_models
+            else 0
+        )
         self._stats.build_time = time.time() - start
         self._stats.device = self._device
 
@@ -314,9 +313,7 @@ class HRM2Engine:
             np.concatenate(all_coarse),
         )
 
-    def query(
-        self, query_vector: np.ndarray, k: int = 10
-    ) -> List[Tuple[GaussianSplat, float]]:
+    def query(self, query_vector: np.ndarray, k: int = 10) -> List[Tuple[GaussianSplat, float]]:
         """
         Query for k most similar splats.
 
@@ -327,9 +324,7 @@ class HRM2Engine:
             raise RuntimeError("Index not built. Call index() first.")
 
         t0 = time.time()
-        q = np.ascontiguousarray(
-            np.asarray(query_vector, dtype=np.float32).flatten()
-        )
+        q = np.ascontiguousarray(np.asarray(query_vector, dtype=np.float32).flatten())
 
         if self._gpu_enabled and self._gpu_searcher is not None:
             results = self._query_gpu(q, k)
@@ -339,19 +334,14 @@ class HRM2Engine:
         self._update_query_stats(time.time() - t0)
         return results
 
-    def _query_gpu(
-        self, q: np.ndarray, k: int
-    ) -> List[Tuple[GaussianSplat, float]]:
+    def _query_gpu(self, q: np.ndarray, k: int) -> List[Tuple[GaussianSplat, float]]:
         """Brute-force search on GPU."""
         indices, distances = self._gpu_searcher.batch_search(q.reshape(1, -1), k)
         return [
-            (self.splats[int(idx)], float(dist))
-            for idx, dist in zip(indices[0], distances[0])
+            (self.splats[int(idx)], float(dist)) for idx, dist in zip(indices[0], distances[0])
         ]
 
-    def _query_cpu(
-        self, q: np.ndarray, k: int
-    ) -> List[Tuple[GaussianSplat, float]]:
+    def _query_cpu(self, q: np.ndarray, k: int) -> List[Tuple[GaussianSplat, float]]:
         """Hierarchical IVF search on CPU."""
         q_norm_sq = float(q @ q)
         global_indices, dist_sq, _ = self._collect_candidates(q, q_norm_sq)
@@ -369,23 +359,16 @@ class HRM2Engine:
         result_indices = global_indices[top_k]
         result_dists = np.sqrt(np.maximum(dist_sq[top_k], 0.0))
 
-        return [
-            (self.splats[idx], float(dist))
-            for idx, dist in zip(result_indices, result_dists)
-        ]
+        return [(self.splats[idx], float(dist)) for idx, dist in zip(result_indices, result_dists)]
 
-    def query_with_details(
-        self, query_vector: np.ndarray, k: int = 10
-    ) -> List[SearchResult]:
+    def query_with_details(self, query_vector: np.ndarray, k: int = 10) -> List[SearchResult]:
         """Query with detailed results including cluster info."""
         if not self._is_indexed:
             raise RuntimeError("Index not built. Call index() first.")
 
         self._ensure_fine_clusters()
 
-        q = np.ascontiguousarray(
-            np.asarray(query_vector, dtype=np.float32).flatten()
-        )
+        q = np.ascontiguousarray(np.asarray(query_vector, dtype=np.float32).flatten())
         q_norm_sq = float(q @ q)
         global_indices, dist_sq, coarse_ids = self._collect_candidates(q, q_norm_sq)
 
@@ -407,9 +390,7 @@ class HRM2Engine:
             cluster_idxs = self._cluster_indices.get(cid, np.array([]))
             pos_in_cluster = int(np.searchsorted(cluster_idxs, gidx))
             fine_id = (
-                int(fine_assigns[pos_in_cluster])
-                if pos_in_cluster < len(fine_assigns)
-                else 0
+                int(fine_assigns[pos_in_cluster]) if pos_in_cluster < len(fine_assigns) else 0
             )
             results.append(
                 SearchResult(
@@ -443,10 +424,7 @@ class HRM2Engine:
             results = []
             for row_idx, row_dist in zip(indices, distances):
                 results.append(
-                    [
-                        (self.splats[int(i)], float(d))
-                        for i, d in zip(row_idx, row_dist)
-                    ]
+                    [(self.splats[int(i)], float(d)) for i, d in zip(row_idx, row_dist)]
                 )
             self._update_query_stats((time.time() - t0) / len(qv))
             return results
@@ -485,6 +463,7 @@ class HRM2Engine:
 # ---------------------------------------------------------------------------
 # Test data generation (uses local RNG — does NOT pollute global seed)
 # ---------------------------------------------------------------------------
+
 
 def generate_test_splats(n_splats: int, seed: int = 42) -> List[GaussianSplat]:
     """

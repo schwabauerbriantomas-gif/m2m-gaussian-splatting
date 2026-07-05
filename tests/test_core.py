@@ -498,9 +498,7 @@ class TestMemoryManager:
         from src.memory.manager import SplatMemoryManager
         from src.core.splat_types import GaussianSplat
 
-        manager = SplatMemoryManager(
-            vram_limit=5, ram_limit=100, eviction_threshold=1.0
-        )
+        manager = SplatMemoryManager(vram_limit=5, ram_limit=100, eviction_threshold=1.0)
         manager.add_splats([GaussianSplat(id=i) for i in range(100)], to_cold=False)
 
         # Access ids 0-4 to promote them to VRAM

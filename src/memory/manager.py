@@ -18,15 +18,17 @@ from ..core.splat_types import GaussianSplat
 @dataclass
 class MemoryConfig:
     """Configuration for memory management."""
-    vram_limit: int = 100000      # Max splats in VRAM (hot tier)
-    ram_limit: int = 1000000      # Max splats in RAM (warm tier)
+
+    vram_limit: int = 100000  # Max splats in VRAM (hot tier)
+    ram_limit: int = 1000000  # Max splats in RAM (warm tier)
     eviction_threshold: float = 0.8  # Evict when usage > 80%
-    access_threshold: int = 10    # Promote after N accesses
+    access_threshold: int = 10  # Promote after N accesses
 
 
 @dataclass
 class MemoryStats:
     """Memory statistics."""
+
     vram_usage: int = 0
     ram_usage: int = 0
     total_splats: int = 0
@@ -57,7 +59,7 @@ class SplatMemoryManager:
         vram_limit: int = 100000,
         ram_limit: int = 1000000,
         eviction_threshold: float = 0.8,
-        access_threshold: int = 10
+        access_threshold: int = 10,
     ):
         """
         Initialize memory manager.

@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """Benchmark GPU vs CPU: m2m-gaussian-splatting v2.0.0"""
+
 import sys, os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from time import time
@@ -52,23 +54,30 @@ def run_bench(n_splats, n_queries=50, use_gpu=False):
 
 SIZES = [1000, 10000, 50000]
 
-print(f"{'N':>10} | {'Device':>6} | {'Build(s)':>8} | {'p50(ms)':>8} | {'p95(ms)':>8} | {'QPS':>10}")
+print(
+    f"{'N':>10} | {'Device':>6} | {'Build(s)':>8} | {'p50(ms)':>8} | {'p95(ms)':>8} | {'QPS':>10}"
+)
 print("-" * 70)
 
 results = []
 for n in SIZES:
     r_cpu = run_bench(n, use_gpu=False)
-    print(f"{r_cpu['n']:>10,} | {r_cpu['device']:>6} | {r_cpu['build_s']:>8.2f} | {r_cpu['p50_ms']:>8.2f} | {r_cpu['p95_ms']:>8.2f} | {r_cpu['qps']:>10.1f}")
+    print(
+        f"{r_cpu['n']:>10,} | {r_cpu['device']:>6} | {r_cpu['build_s']:>8.2f} | {r_cpu['p50_ms']:>8.2f} | {r_cpu['p95_ms']:>8.2f} | {r_cpu['qps']:>10.1f}"
+    )
     results.append(r_cpu)
 
     if HAS_CUDA:
         r_gpu = run_bench(n, use_gpu=True)
         speedup = r_cpu["p50_ms"] / r_gpu["p50_ms"] if r_gpu["p50_ms"] > 0 else 0
-        print(f"{r_gpu['n']:>10,} | {r_gpu['device']:>6} | {r_gpu['build_s']:>8.2f} | {r_gpu['p50_ms']:>8.2f} | {r_gpu['p95_ms']:>8.2f} | {r_gpu['qps']:>10.1f}  ({speedup:.1f}x)")
+        print(
+            f"{r_gpu['n']:>10,} | {r_gpu['device']:>6} | {r_gpu['build_s']:>8.2f} | {r_gpu['p50_ms']:>8.2f} | {r_gpu['p95_ms']:>8.2f} | {r_gpu['qps']:>10.1f}  ({speedup:.1f}x)"
+        )
         results.append(r_gpu)
     print()
 
 import json
+
 with open(os.path.join(os.path.dirname(__file__), "..", "benchmark_results.json"), "w") as f:
     json.dump(results, f, indent=2)
 print("\nResults saved to benchmark_results.json")

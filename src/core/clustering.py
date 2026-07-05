@@ -11,26 +11,27 @@ from dataclasses import dataclass
 
 try:
     from numba import njit, prange
+
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
+
     def njit(*args, **kwargs):
         def decorator(func):
             return func
+
         if len(args) == 1 and callable(args[0]):
             return args[0]
         return decorator
+
     prange = range
 
 
 # ==================== K-MEANS++ INITIALIZATION ====================
 
+
 @njit(fastmath=True, cache=True)
-def kmeans_plusplus_init(
-    data: np.ndarray,
-    n_clusters: int,
-    random_state: int = 42
-) -> np.ndarray:
+def kmeans_plusplus_init(data: np.ndarray, n_clusters: int, random_state: int = 42) -> np.ndarray:
     """
     KMeans++ initialization for better centroid selection.
 
@@ -93,89 +94,84 @@ def kmeans_plusplus_init(
 
 # ==================== CLUSTER ASSIGNMENT ====================
 
+
 @njit(fastmath=True, cache=True)
-def assign_clusters(
-    data: np.ndarray,
-    centroids: np.ndarray
-) -> np.ndarray:
+def assign_clusters(data: np.ndarray, centroids: np.ndarray) -> np.ndarray:
     """
     Assign each point to nearest centroid.
-    
+
     Args:
         data: (N, D) array
         centroids: (K, D) array
-    
+
     Returns:
         (N,) array of cluster labels
     """
     N = data.shape[0]
     K = centroids.shape[0]
     labels = np.zeros(N, dtype=np.int32)
-    
+
     for i in prange(N):
         min_dist = np.inf
         min_label = 0
-        
+
         for k in range(K):
             dist = 0.0
             for d in range(data.shape[1]):
                 diff = data[i, d] - centroids[k, d]
                 dist += diff * diff
-            
+
             if dist < min_dist:
                 min_dist = dist
                 min_label = k
-        
+
         labels[i] = min_label
-    
+
     return labels
 
 
 # ==================== CENTROID UPDATE ====================
 
+
 @njit(fastmath=True, cache=True)
 def update_centroids(
-    data: np.ndarray,
-    labels: np.ndarray,
-    n_clusters: int
+    data: np.ndarray, labels: np.ndarray, n_clusters: int
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Update centroids based on cluster assignments.
-    
+
     Args:
         data: (N, D) array
         labels: (N,) cluster labels
         n_clusters: Number of clusters
-    
+
     Returns:
         Tuple of (new_centroids, cluster_sizes)
     """
     N, D = data.shape
     centroids = np.zeros((n_clusters, D), dtype=np.float32)
     counts = np.zeros(n_clusters, dtype=np.int32)
-    
+
     for i in range(N):
         k = labels[i]
         counts[k] += 1
         for d in range(D):
             centroids[k, d] += data[i, d]
-    
+
     for k in range(n_clusters):
         if counts[k] > 0:
             for d in range(D):
                 centroids[k, d] /= counts[k]
-    
+
     return centroids, counts
 
 
 # ==================== MINI-BATCH K-MEANS ====================
 
+
 @njit(fastmath=True, cache=True)
 def mini_batch_kmeans(
-    data: np.ndarray,
-    initial_centroids: np.ndarray,
-    batch_size: int = 1000,
-    max_iter: int = 100
+    data: np.ndarray, initial_centroids: np.ndarray, batch_size: int = 1000, max_iter: int = 100
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Mini-batch KMeans for large datasets.
@@ -222,55 +218,56 @@ def mini_batch_kmeans(
 
 # ==================== FULL K-MEANS ====================
 
+
 @njit(fastmath=True, cache=True)
 def kmeans_full(
     data: np.ndarray,
     n_clusters: int,
     max_iter: int = 100,
     tol: float = 1e-4,
-    random_state: int = 42
+    random_state: int = 42,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Full K-Means clustering with Numba JIT.
-    
+
     Args:
         data: (N, D) array
         n_clusters: Number of clusters
         max_iter: Maximum iterations
         tol: Convergence tolerance
         random_state: Random seed
-    
+
     Returns:
         Tuple of (centroids, labels, inertia)
     """
     # Initialize with K-Means++
     centroids = kmeans_plusplus_init(data, n_clusters, random_state)
-    
+
     for iteration in range(max_iter):
         # Assign clusters
         labels = assign_clusters(data, centroids)
-        
+
         # Update centroids
         new_centroids, counts = update_centroids(data, labels, n_clusters)
-        
+
         # Handle empty clusters
         for k in range(n_clusters):
             if counts[k] == 0:
                 idx = np.random.randint(0, data.shape[0])
                 new_centroids[k] = data[idx]
-        
+
         # Check convergence
         shift = 0.0
         for k in range(n_clusters):
             for d in range(data.shape[1]):
                 diff = new_centroids[k, d] - centroids[k, d]
                 shift += diff * diff
-        
+
         centroids = new_centroids
-        
+
         if shift < tol:
             break
-    
+
     # Compute final inertia
     labels = assign_clusters(data, centroids)
     inertia = 0.0
@@ -279,15 +276,17 @@ def kmeans_full(
         for d in range(data.shape[1]):
             diff = data[i, d] - centroids[k, d]
             inertia += diff * diff
-    
+
     return centroids, labels, inertia
 
 
 # ==================== PYTHON WRAPPER ====================
 
+
 @dataclass
 class KMeansResult:
     """Result of K-Means clustering."""
+
     centroids: np.ndarray
     labels: np.ndarray
     inertia: float
@@ -297,26 +296,26 @@ class KMeansResult:
 class KMeans:
     """
     K-Means clustering with Mini-batch optimization.
-    
+
     Uses Mini-batch K-Means for efficiency on large datasets.
-    
+
     Example:
         >>> kmeans = KMeans(n_clusters=100, batch_size=1000)
         >>> result = kmeans.fit(data)
         >>> labels = kmeans.predict(new_data)
     """
-    
+
     def __init__(
         self,
         n_clusters: int = 100,
         batch_size: int = 1000,
         max_iter: int = 100,
         random_state: int = 42,
-        use_mini_batch: bool = True
+        use_mini_batch: bool = True,
     ):
         """
         Initialize K-Means.
-        
+
         Args:
             n_clusters: Number of clusters
             batch_size: Mini-batch size (for mini-batch mode)
@@ -329,32 +328,32 @@ class KMeans:
         self.max_iter = max_iter
         self.random_state = random_state
         self.use_mini_batch = use_mini_batch
-        
+
         self.centroids_: Optional[np.ndarray] = None
         self.labels_: Optional[np.ndarray] = None
         self.inertia_: Optional[float] = None
         self.n_iter_: int = 0
-    
-    def fit(self, data: np.ndarray) -> 'KMeans':
+
+    def fit(self, data: np.ndarray) -> "KMeans":
         """
         Fit K-Means to data.
-        
+
         Args:
             data: (N, D) array of data points
-        
+
         Returns:
             self
         """
         data = np.ascontiguousarray(data.astype(np.float32))
-        
+
         if data.ndim == 1:
             data = data.reshape(-1, 1)
-        
+
         n_clusters = min(self.n_clusters, data.shape[0])
-        
+
         # Initialize centroids
         initial_centroids = kmeans_plusplus_init(data, n_clusters, self.random_state)
-        
+
         if self.use_mini_batch:
             self.centroids_, self.labels_ = mini_batch_kmeans(
                 data, initial_centroids, self.batch_size, self.max_iter
@@ -363,41 +362,41 @@ class KMeans:
             self.centroids_, self.labels_, self.inertia_ = kmeans_full(
                 data, n_clusters, self.max_iter, 1e-4, self.random_state
             )
-        
+
         return self
-    
+
     def predict(self, data: np.ndarray) -> np.ndarray:
         """
         Predict cluster labels for new data.
-        
+
         Args:
             data: (N, D) array
-        
+
         Returns:
             (N,) array of cluster labels
         """
         if self.centroids_ is None:
             raise RuntimeError("Must call fit() before predict()")
-        
+
         data = np.ascontiguousarray(data.astype(np.float32))
         if data.ndim == 1:
             data = data.reshape(-1, 1)
-        
+
         return assign_clusters(data, self.centroids_)
-    
+
     def fit_predict(self, data: np.ndarray) -> np.ndarray:
         """
         Fit and return labels.
-        
+
         Args:
             data: (N, D) array
-        
+
         Returns:
             (N,) array of cluster labels
         """
         self.fit(data)
         return self.labels_
-    
+
     def transform(self, data: np.ndarray) -> np.ndarray:
         """
         Transform data to cluster-distance space.
@@ -416,9 +415,9 @@ class KMeans:
             data = data.reshape(-1, 1)
 
         # Vectorized: ||data - centroid||² = ||data||² + ||centroid||² - 2·data·centroidᵀ
-        data_norms = np.sum(data ** 2, axis=1, keepdims=True)     # (N, 1)
-        cent_norms = np.sum(self.centroids_ ** 2, axis=1)         # (K,)
-        cross = data @ self.centroids_.T                           # (N, K)
+        data_norms = np.sum(data**2, axis=1, keepdims=True)  # (N, 1)
+        cent_norms = np.sum(self.centroids_**2, axis=1)  # (K,)
+        cross = data @ self.centroids_.T  # (N, K)
         dist_sq = data_norms + cent_norms - 2.0 * cross
         return np.sqrt(np.maximum(dist_sq, 0.0))
 
