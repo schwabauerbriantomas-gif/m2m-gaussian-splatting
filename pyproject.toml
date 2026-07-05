@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "m2m-gaussian-splatting"
-version = "1.1.0"
+version = "2.0.0"
 description = "Hierarchical Retrieval and Memory Management for 3D Gaussian Splatting"
 readme = "README.md"
 license = {text = "MIT"}
@@ -16,6 +16,7 @@ keywords = [
     "gaussian-splatting", "3dgs", "hierarchical-retrieval", "vector-search",
     "numba", "kmeans", "similarity-search", "point-cloud", "embedding",
     "cpu-optimized", "memory-management", "hrm2", "clustering",
+    "gpu", "cuda", "pytorch",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -34,6 +35,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gpu = [
+    "torch>=2.0.0",
+]
 api = [
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",

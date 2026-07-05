@@ -3,16 +3,38 @@ HRM2 Engine - Hierarchical Retrieval Model 2
 
 Implements a two-level hierarchical index for fast similarity search
 in large-scale Gaussian splat datasets.
+
+GPU acceleration (CUDA via PyTorch) is used automatically when available.
+Falls back to CPU (Numba/NumPy) transparently.
 """
 
-import numpy as np
-from typing import List, Tuple, Optional, Dict, Any
-from dataclasses import dataclass, field
+import logging
 import time
+import numpy as np
+from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass
 
-from .splat_types import GaussianSplat, SplatEmbedding, SplatCluster
+from .splat_types import GaussianSplat
 from .encoding import FullEmbeddingBuilder
-from .clustering import KMeans, assign_clusters
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Attempt to import clustering backends — CPU (Numba) and GPU (PyTorch)
+# ---------------------------------------------------------------------------
+from .clustering import KMeans, assign_clusters as _cpu_assign
+
+_GPU_OK = False
+try:
+    from ..gpu import HAS_CUDA, HAS_TORCH
+    from ..gpu.gpu_kmeans import TorchKMeans
+    from ..gpu.gpu_search import GPUSearcher
+
+    if HAS_TORCH:
+        _GPU_OK = True
+except ImportError:
+    pass
 
 
 @dataclass
@@ -27,12 +49,13 @@ class SearchResult:
 @dataclass
 class HRM2Config:
     """Configuration for HRM2 Engine."""
-    n_coarse: int = 100          # Number of coarse clusters
-    n_fine: int = 1000           # Number of fine clusters per coarse
-    embedding_dim: int = 640     # Embedding dimension (informational; actual dim from FullEmbeddingBuilder)
-    n_probe: int = 5             # Clusters to probe during search
-    batch_size: int = 10000      # Batch size for K-Means
+    n_coarse: int = 100
+    n_fine: int = 1000
+    embedding_dim: int = 640
+    n_probe: int = 5
+    batch_size: int = 10000
     random_state: int = 42
+    use_gpu: bool = True  # auto-detect; set False to force CPU
 
 
 @dataclass
@@ -44,18 +67,20 @@ class HRM2Stats:
     build_time: float = 0.0
     avg_query_time: float = 0.0
     total_queries: int = 0
+    device: str = "cpu"
 
 
 class HRM2Engine:
     """
     Hierarchical Retrieval Model 2 (HRM2) Engine.
 
-    Implements a two-level hierarchical index:
+    Two-level hierarchical index:
     - Level 1 (Coarse): K-Means clusters for fast pruning
     - Level 2 (Fine): Additional clustering within each coarse cluster
 
-    This provides significant speedup over brute-force search while
-    maintaining high recall.
+    GPU acceleration is used automatically when PyTorch+CUDA are available.
+    The search hot-path routes through :class:`GPUSearcher` for brute-force
+    L2 when a GPU is present, or through the hierarchical IVF path on CPU.
 
     Example:
         >>> engine = HRM2Engine(n_coarse=100, n_fine=1000)
@@ -71,19 +96,9 @@ class HRM2Engine:
         embedding_dim: int = 640,
         n_probe: int = 5,
         batch_size: int = 10000,
-        random_state: int = 42
+        random_state: int = 42,
+        use_gpu: bool = True,
     ):
-        """
-        Initialize HRM2 Engine.
-
-        Args:
-            n_coarse: Number of coarse clusters
-            n_fine: Fine clusters per coarse cluster
-            embedding_dim: Dimension of embedding vectors (informational)
-            n_probe: Coarse clusters to search
-            batch_size: Batch size for K-Means
-            random_state: Random seed
-        """
         self.n_coarse = n_coarse
         self.n_fine = n_fine
         self.embedding_dim = embedding_dim
@@ -91,35 +106,69 @@ class HRM2Engine:
         self.batch_size = batch_size
         self.random_state = random_state
 
+        # GPU detection
+        self._gpu_enabled = use_gpu and _GPU_OK and HAS_CUDA
+        self._device = "cuda" if self._gpu_enabled else "cpu"
+
         # Storage
         self.splats: List[GaussianSplat] = []
         self.embeddings: Optional[np.ndarray] = None
 
         # Index
-        self.coarse_model: Optional[KMeans] = None
+        self.coarse_model = None  # KMeans or TorchKMeans
         self.coarse_assignments: Optional[np.ndarray] = None
-        self.fine_models: Dict[int, KMeans] = {}
+        self.fine_models: Dict[int, Optional[object]] = {}
         self.fine_assignments: Dict[int, np.ndarray] = {}
 
-        # Precomputed cluster → global index mapping (built at index time)
+        # GPU searcher (built at index time when GPU is active)
+        self._gpu_searcher: Optional["GPUSearcher"] = None
+
+        # Precomputed lookups
         self._cluster_indices: Dict[int, np.ndarray] = {}
-        # Precomputed embedding norms (for query distance reuse)
         self._emb_norms_sq: Optional[np.ndarray] = None
 
         # Encoder
         self.encoder = FullEmbeddingBuilder()
 
-        # Statistics
+        # Stats
         self._is_indexed = False
-        self._stats = HRM2Stats()
+        self._stats = HRM2Stats(device=self._device)
+
+    # ------------------------------------------------------------------
+    # Build
+    # ------------------------------------------------------------------
+
+    def _build_fine_clusters(self, n_coarse: int) -> None:
+        """Build fine sub-clusters within each coarse cluster (CPU only)."""
+        for cid in range(n_coarse):
+            cluster_idxs = self._cluster_indices[cid]
+            if len(cluster_idxs) < 2:
+                self.fine_models[cid] = None
+                self.fine_assignments[cid] = np.zeros(
+                    len(cluster_idxs), dtype=np.int32
+                )
+                continue
+
+            cluster_emb = np.ascontiguousarray(
+                self.embeddings[cluster_idxs].astype(np.float32)
+            )
+            n_fine = max(1, min(self.n_fine, len(cluster_idxs) // 5))
+
+            fm = KMeans(
+                n_clusters=n_fine,
+                batch_size=min(self.batch_size, len(cluster_idxs)),
+                random_state=self.random_state + cid,
+            )
+            self.fine_models[cid] = fm
+            self.fine_assignments[cid] = fm.fit_predict(cluster_emb)
+
+    def _ensure_fine_clusters(self) -> None:
+        """Lazily build fine clusters if not yet built."""
+        if not self.fine_models and self._is_indexed:
+            self._build_fine_clusters(len(self._cluster_indices))
 
     def add_splats(self, splats: List[GaussianSplat]) -> None:
-        """
-        Add splats to the engine.
-
-        Args:
-            splats: List of GaussianSplat objects
-        """
+        """Add splats to the engine."""
         self.splats.extend(splats)
         self._is_indexed = False
 
@@ -128,129 +177,129 @@ class HRM2Engine:
         Build the hierarchical index.
 
         Returns:
-            Time taken to build index
+            Build time in seconds.
         """
-        start_time = time.time()
+        start = time.time()
 
-        if len(self.splats) == 0:
+        if not self.splats:
             return 0.0
 
-        # Build embeddings
-        positions = np.array([s.position for s in self.splats])
-        colors = np.array([s.color for s in self.splats])
-        opacities = np.array([s.opacity for s in self.splats])
-        scales = np.array([s.scale for s in self.splats])
-        rotations = np.array([s.rotation for s in self.splats])
+        # Vectorized attribute extraction (avoid list-comprehension overhead)
+        N = len(self.splats)
+        positions = np.empty((N, 3), dtype=np.float32)
+        colors = np.empty((N, 3), dtype=np.float32)
+        opacities = np.empty(N, dtype=np.float32)
+        scales = np.empty((N, 3), dtype=np.float32)
+        rotations = np.empty((N, 4), dtype=np.float32)
+
+        for i, s in enumerate(self.splats):
+            positions[i] = s.position
+            colors[i] = s.color
+            opacities[i] = s.opacity
+            scales[i] = s.scale
+            rotations[i] = s.rotation
 
         self.embeddings = self.encoder.build(
             positions, colors, opacities, scales, rotations
         )
-
-        # Ensure correct dtype
         self.embeddings = np.ascontiguousarray(self.embeddings.astype(np.float32))
-
-        # Update embedding_dim to actual value
         self.embedding_dim = self.embeddings.shape[1]
-
-        # Precompute embedding squared norms (reused in queries)
-        self._emb_norms_sq = np.sum(self.embeddings ** 2, axis=1)
+        self._emb_norms_sq = np.sum(self.embeddings**2, axis=1)
 
         n_samples = len(self.splats)
 
-        # Level 1: Coarse clustering
-        n_coarse_effective = min(self.n_coarse, n_samples // 10)
-        n_coarse_effective = max(1, n_coarse_effective)
+        # --- GPU brute-force searcher ----------------------------------
+        if self._gpu_enabled:
+            try:
+                self._gpu_searcher = GPUSearcher(
+                    self.embeddings,
+                    device="cuda",
+                    max_batch_size=256,
+                )
+                logger.info("GPU searcher initialized on %s", self._device)
+            except Exception:
+                logger.warning("GPU searcher init failed, falling back to CPU IVF")
+                self._gpu_enabled = False
+                self._device = "cpu"
+                self._stats.device = "cpu"
 
-        self.coarse_model = KMeans(
-            n_clusters=n_coarse_effective,
-            batch_size=self.batch_size,
-            random_state=self.random_state
-        )
+        # --- Coarse clustering ----------------------------------------
+        n_coarse = max(1, min(self.n_coarse, n_samples // 10))
+
+        if self._gpu_enabled:
+            self.coarse_model = TorchKMeans(
+                n_clusters=n_coarse,
+                batch_size=self.batch_size,
+                random_state=self.random_state,
+                device="cuda",
+            )
+        else:
+            self.coarse_model = KMeans(
+                n_clusters=n_coarse,
+                batch_size=self.batch_size,
+                random_state=self.random_state,
+            )
         self.coarse_assignments = self.coarse_model.fit_predict(self.embeddings)
 
-        # Precompute cluster → global index mapping for fast lookup at query time
+        # cluster → global index
         self._cluster_indices = {}
-        for coarse_id in range(n_coarse_effective):
-            mask = self.coarse_assignments == coarse_id
-            self._cluster_indices[coarse_id] = np.where(mask)[0]
+        for cid in range(n_coarse):
+            self._cluster_indices[cid] = np.where(self.coarse_assignments == cid)[0]
 
-        # Level 2: Fine clustering within each coarse cluster
+        # --- Fine clustering (lazy — only built when query_with_details is used)
+        # On GPU, skip fine clustering entirely since search is brute-force.
+        # On CPU, defer to keep index() fast.
         self.fine_models = {}
         self.fine_assignments = {}
-
-        for coarse_id in range(n_coarse_effective):
-            cluster_indices = self._cluster_indices[coarse_id]
-
-            if len(cluster_indices) < 2:
-                self.fine_models[coarse_id] = None
-                self.fine_assignments[coarse_id] = np.zeros(len(cluster_indices), dtype=np.int32)
-                continue
-
-            cluster_embeddings = np.ascontiguousarray(self.embeddings[cluster_indices].astype(np.float32))
-
-            # Dynamic n_fine based on cluster size
-            n_fine_effective = min(self.n_fine, len(cluster_indices) // 5)
-            n_fine_effective = max(1, n_fine_effective)
-
-            fine_model = KMeans(
-                n_clusters=n_fine_effective,
-                batch_size=min(self.batch_size, len(cluster_indices)),
-                random_state=self.random_state + coarse_id
-            )
-
-            self.fine_models[coarse_id] = fine_model
-            self.fine_assignments[coarse_id] = fine_model.fit_predict(cluster_embeddings)
+        if not self._gpu_enabled:
+            self._build_fine_clusters(n_coarse)
 
         self._is_indexed = True
 
-        # Update stats
         self._stats.n_splats = n_samples
-        self._stats.n_coarse_clusters = n_coarse_effective
+        self._stats.n_coarse_clusters = n_coarse
         self._stats.n_fine_clusters = sum(
             m.n_clusters if m else 0 for m in self.fine_models.values()
-        )
-        self._stats.build_time = time.time() - start_time
+        ) if self.fine_models else 0
+        self._stats.build_time = time.time() - start
+        self._stats.device = self._device
 
         return self._stats.build_time
 
+    # ------------------------------------------------------------------
+    # Query
+    # ------------------------------------------------------------------
+
     def _collect_candidates(
-        self,
-        query_vector: np.ndarray,
-        query_norm_sq: float
+        self, query_vector: np.ndarray, query_norm_sq: float
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Collect candidate splats from nearest coarse clusters.
 
-        Uses squared L2 distance (||q-m||² = ||q||² + ||m||² - 2·q·m)
-        to avoid sqrt in the ranking stage.
-
         Returns:
-            Tuple of (global_indices, squared_distances, coarse_ids)
+            ``(global_indices, squared_distances, coarse_ids)``
         """
-        # Find nearest coarse clusters via argpartition (O(K) vs O(K log K))
         coarse_distances = self.coarse_model.transform(query_vector.reshape(1, -1))[0]
         n_probe = min(self.n_probe, len(coarse_distances))
-        closest_coarse = np.argpartition(coarse_distances, n_probe - 1)[:n_probe]
-        closest_coarse = closest_coarse[np.argsort(coarse_distances[closest_coarse])]
+        closest = np.argpartition(coarse_distances, n_probe - 1)[:n_probe]
+        closest = closest[np.argsort(coarse_distances[closest])]
 
-        all_indices = []
-        all_dist_sq = []
-        all_coarse = []
+        all_indices: List[np.ndarray] = []
+        all_dist_sq: List[np.ndarray] = []
+        all_coarse: List[np.ndarray] = []
 
-        for coarse_id in closest_coarse:
-            cluster_indices = self._cluster_indices.get(coarse_id)
-            if cluster_indices is None or len(cluster_indices) == 0:
+        for cid in closest:
+            cluster_idxs = self._cluster_indices.get(cid)
+            if cluster_idxs is None or len(cluster_idxs) == 0:
                 continue
-
-            cluster_emb = self.embeddings[cluster_indices]
-            # Squared L2 via Gram trick: ||q-m||² = ||q||² + ||m||² - 2·q·m
-            cross = cluster_emb @ query_vector            # (M,)
-            cluster_norm_sq = self._emb_norms_sq[cluster_indices]
+            cluster_emb = self.embeddings[cluster_idxs]
+            cross = cluster_emb @ query_vector
+            cluster_norm_sq = self._emb_norms_sq[cluster_idxs]
             dist_sq = query_norm_sq + cluster_norm_sq - 2.0 * cross
 
-            all_indices.append(cluster_indices)
+            all_indices.append(cluster_idxs)
             all_dist_sq.append(dist_sq)
-            all_coarse.append(np.full(len(cluster_indices), coarse_id, dtype=np.int32))
+            all_coarse.append(np.full(len(cluster_idxs), cid, dtype=np.int32))
 
         if not all_indices:
             return (
@@ -266,51 +315,59 @@ class HRM2Engine:
         )
 
     def query(
-        self,
-        query_vector: np.ndarray,
-        k: int = 10
+        self, query_vector: np.ndarray, k: int = 10
     ) -> List[Tuple[GaussianSplat, float]]:
         """
         Query for k most similar splats.
 
-        Args:
-            query_vector: Query embedding vector
-            k: Number of results
-
-        Returns:
-            List of (Splat, distance) tuples
+        Uses GPU brute-force when available, otherwise the hierarchical
+        IVF path on CPU.
         """
         if not self._is_indexed:
             raise RuntimeError("Index not built. Call index() first.")
 
-        query_start = time.time()
-
-        query_vector = np.ascontiguousarray(
+        t0 = time.time()
+        q = np.ascontiguousarray(
             np.asarray(query_vector, dtype=np.float32).flatten()
         )
-        query_norm_sq = float(query_vector @ query_vector)
 
-        global_indices, dist_sq, _ = self._collect_candidates(query_vector, query_norm_sq)
+        if self._gpu_enabled and self._gpu_searcher is not None:
+            results = self._query_gpu(q, k)
+        else:
+            results = self._query_cpu(q, k)
+
+        self._update_query_stats(time.time() - t0)
+        return results
+
+    def _query_gpu(
+        self, q: np.ndarray, k: int
+    ) -> List[Tuple[GaussianSplat, float]]:
+        """Brute-force search on GPU."""
+        indices, distances = self._gpu_searcher.batch_search(q.reshape(1, -1), k)
+        return [
+            (self.splats[int(idx)], float(dist))
+            for idx, dist in zip(indices[0], distances[0])
+        ]
+
+    def _query_cpu(
+        self, q: np.ndarray, k: int
+    ) -> List[Tuple[GaussianSplat, float]]:
+        """Hierarchical IVF search on CPU."""
+        q_norm_sq = float(q @ q)
+        global_indices, dist_sq, _ = self._collect_candidates(q, q_norm_sq)
 
         if len(global_indices) == 0:
-            self._update_query_stats(time.time() - query_start)
             return []
 
-        # Top-k via argpartition (O(N) vs O(N log N) for sort)
         k_actual = min(k, len(global_indices))
         if k_actual < len(global_indices):
             top_k = np.argpartition(dist_sq, k_actual - 1)[:k_actual]
         else:
             top_k = np.arange(len(global_indices))
-
-        # Sort just the k results by distance
         top_k = top_k[np.argsort(dist_sq[top_k])]
 
-        # Convert squared distance to actual distance (sqrt only k values)
         result_indices = global_indices[top_k]
         result_dists = np.sqrt(np.maximum(dist_sq[top_k], 0.0))
-
-        self._update_query_stats(time.time() - query_start)
 
         return [
             (self.splats[idx], float(dist))
@@ -318,42 +375,28 @@ class HRM2Engine:
         ]
 
     def query_with_details(
-        self,
-        query_vector: np.ndarray,
-        k: int = 10
+        self, query_vector: np.ndarray, k: int = 10
     ) -> List[SearchResult]:
-        """
-        Query with detailed results including cluster info.
-
-        Args:
-            query_vector: Query embedding vector
-            k: Number of results
-
-        Returns:
-            List of SearchResult objects
-        """
+        """Query with detailed results including cluster info."""
         if not self._is_indexed:
             raise RuntimeError("Index not built. Call index() first.")
 
-        query_vector = np.ascontiguousarray(
+        self._ensure_fine_clusters()
+
+        q = np.ascontiguousarray(
             np.asarray(query_vector, dtype=np.float32).flatten()
         )
-        query_norm_sq = float(query_vector @ query_vector)
-
-        global_indices, dist_sq, coarse_ids = self._collect_candidates(
-            query_vector, query_norm_sq
-        )
+        q_norm_sq = float(q @ q)
+        global_indices, dist_sq, coarse_ids = self._collect_candidates(q, q_norm_sq)
 
         if len(global_indices) == 0:
             return []
 
-        # Top-k via argpartition
         k_actual = min(k, len(global_indices))
         if k_actual < len(global_indices):
             top_k = np.argpartition(dist_sq, k_actual - 1)[:k_actual]
         else:
             top_k = np.arange(len(global_indices))
-
         top_k = top_k[np.argsort(dist_sq[top_k])]
 
         results = []
@@ -361,60 +404,67 @@ class HRM2Engine:
             gidx = global_indices[local_j]
             cid = int(coarse_ids[local_j])
             fine_assigns = self.fine_assignments.get(cid, np.zeros(0, dtype=np.int32))
-            # Map global index to position within cluster
             cluster_idxs = self._cluster_indices.get(cid, np.array([]))
-            pos_in_cluster = np.searchsorted(cluster_idxs, gidx)
-            fine_id = int(fine_assigns[pos_in_cluster]) if pos_in_cluster < len(fine_assigns) else 0
-
-            results.append(SearchResult(
-                splat_id=self.splats[gidx].id,
-                distance=float(np.sqrt(max(dist_sq[local_j], 0.0))),
-                coarse_cluster=cid,
-                fine_cluster=fine_id
-            ))
-
+            pos_in_cluster = int(np.searchsorted(cluster_idxs, gidx))
+            fine_id = (
+                int(fine_assigns[pos_in_cluster])
+                if pos_in_cluster < len(fine_assigns)
+                else 0
+            )
+            results.append(
+                SearchResult(
+                    splat_id=self.splats[gidx].id,
+                    distance=float(np.sqrt(max(dist_sq[local_j], 0.0))),
+                    coarse_cluster=cid,
+                    fine_cluster=fine_id,
+                )
+            )
         return results
 
     def batch_query(
-        self,
-        query_vectors: np.ndarray,
-        k: int = 10
+        self, query_vectors: np.ndarray, k: int = 10
     ) -> List[List[Tuple[GaussianSplat, float]]]:
         """
         Batch query for multiple queries.
 
-        Args:
-            query_vectors: (B, D) array of query vectors
-            k: Number of results per query
-
-        Returns:
-            List of result lists, one per query
+        On GPU this is fully parallelized. On CPU it iterates.
         """
         if not self._is_indexed:
             raise RuntimeError("Index not built. Call index() first.")
 
-        query_vectors = np.ascontiguousarray(
-            np.asarray(query_vectors, dtype=np.float32)
-        )
-        if query_vectors.ndim == 1:
-            query_vectors = query_vectors.reshape(1, -1)
+        qv = np.ascontiguousarray(np.asarray(query_vectors, dtype=np.float32))
+        if qv.ndim == 1:
+            qv = qv.reshape(1, -1)
 
-        results = []
-        for i in range(query_vectors.shape[0]):
-            results.append(self.query(query_vectors[i], k=k))
+        # GPU batch path — single upload, parallel top-k
+        if self._gpu_enabled and self._gpu_searcher is not None:
+            t0 = time.time()
+            indices, distances = self._gpu_searcher.batch_search(qv, k)
+            results = []
+            for row_idx, row_dist in zip(indices, distances):
+                results.append(
+                    [
+                        (self.splats[int(i)], float(d))
+                        for i, d in zip(row_idx, row_dist)
+                    ]
+                )
+            self._update_query_stats((time.time() - t0) / len(qv))
+            return results
 
-        return results
+        # CPU path
+        return [self.query(qv[i], k=k) for i in range(qv.shape[0])]
+
+    # ------------------------------------------------------------------
+    # Utils
+    # ------------------------------------------------------------------
 
     def _update_query_stats(self, query_time: float) -> None:
-        """Update running query statistics."""
         self._stats.total_queries += 1
         self._stats.avg_query_time = (
-            (self._stats.avg_query_time * (self._stats.total_queries - 1) + query_time)
-            / self._stats.total_queries
-        )
+            self._stats.avg_query_time * (self._stats.total_queries - 1) + query_time
+        ) / self._stats.total_queries
 
     def get_stats(self) -> HRM2Stats:
-        """Get engine statistics."""
         return self._stats
 
     def clear(self) -> None:
@@ -427,35 +477,35 @@ class HRM2Engine:
         self.fine_assignments = {}
         self._cluster_indices = {}
         self._emb_norms_sq = None
+        self._gpu_searcher = None
         self._is_indexed = False
-        self._stats = HRM2Stats()
+        self._stats = HRM2Stats(device=self._device)
 
+
+# ---------------------------------------------------------------------------
+# Test data generation (uses local RNG — does NOT pollute global seed)
+# ---------------------------------------------------------------------------
 
 def generate_test_splats(n_splats: int, seed: int = 42) -> List[GaussianSplat]:
     """
     Generate synthetic splats for testing.
 
-    Args:
-        n_splats: Number of splats
-        seed: Random seed
-
-    Returns:
-        List of GaussianSplat objects
+    Uses a local :class:`~numpy.random.RandomState` so the global
+    NumPy RNG state is never modified.
     """
-    np.random.seed(seed)
-
+    rng = np.random.RandomState(seed)
     splats = []
     for i in range(n_splats):
-        splat = GaussianSplat(
-            id=i,
-            position=np.random.randn(3).astype(np.float32) * 10,
-            color=np.random.rand(3).astype(np.float32),
-            opacity=np.random.rand(),
-            scale=np.exp(np.random.randn(3).astype(np.float32) * -2),
-            rotation=np.random.randn(4).astype(np.float32)
+        rot = rng.randn(4).astype(np.float32)
+        rot /= np.linalg.norm(rot)
+        splats.append(
+            GaussianSplat(
+                id=i,
+                position=rng.randn(3).astype(np.float32) * 10,
+                color=rng.rand(3).astype(np.float32),
+                opacity=float(rng.rand()),
+                scale=np.exp(rng.randn(3).astype(np.float32) * -2),
+                rotation=rot,
+            )
         )
-        # Normalize quaternion
-        splat.rotation /= np.linalg.norm(splat.rotation)
-        splats.append(splat)
-
     return splats

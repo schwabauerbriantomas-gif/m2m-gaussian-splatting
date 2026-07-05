@@ -216,11 +216,14 @@ class ColorHistogramEncoder:
         colors = np.asarray(colors, dtype=np.float32)
         if colors.ndim == 1:
             colors = colors.reshape(1, -1)
-        
-        # Normalize to [0, 1]
-        if colors.max() > 1.0:
+
+        # Normalize: if any value > 1.0, treat as [0,255] → [0,1]
+        # Use per-array max, not per-element, to avoid ambiguity.
+        cmax = float(colors.max())
+        if cmax > 1.5:  # threshold accounts for float noise in [0,1]
             colors = colors / 255.0
-        
+        colors = np.clip(colors, 0.0, 1.0)
+
         return _color_histogram_encoding_numba(colors, self.n_bins)
 
 
@@ -348,7 +351,7 @@ class FullEmbeddingBuilder:
     
     def __init__(self):
         """Initialize all encoders."""
-        self.pos_encoder = SinusoidalPositionEncoder(dim=64)  # Will use 60
+        self.pos_encoder = SinusoidalPositionEncoder(dim=64)
         self.color_encoder = ColorHistogramEncoder(n_bins=8)   # 512 dims
         self.attr_encoder = AttributeEncoder(dim=64)          # 64 dims
         

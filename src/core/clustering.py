@@ -46,9 +46,13 @@ def kmeans_plusplus_init(
     Returns:
         (n_clusters, D) array of initial centroids
     """
-    np.random.seed(random_state)
     N, D = data.shape
     centroids = np.zeros((n_clusters, D), dtype=np.float32)
+
+    # Note: Numba @njit functions cannot accept a RandomState object.
+    # We use np.random.seed() here but document that callers who need
+    # reproducibility should set the seed before calling fit().
+    np.random.seed(random_state)
 
     # Choose first centroid randomly
     idx = np.random.randint(0, N)

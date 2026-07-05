@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple, Optional
 from collections import OrderedDict
 from dataclasses import dataclass, field
 import numpy as np
+import threading
 import time
 
 from ..core.splat_types import GaussianSplat
@@ -83,6 +84,9 @@ class SplatMemoryManager:
         # Statistics
         self._stats = MemoryStats()
 
+        # Thread safety
+        self._lock = threading.RLock()
+
     def add_splats(self, splats: List[GaussianSplat], to_cold: bool = True) -> None:
         """
         Add splats to memory.
@@ -91,15 +95,16 @@ class SplatMemoryManager:
             splats: List of splats to add
             to_cold: If True, add to cold storage initially
         """
-        for splat in splats:
-            if to_cold:
-                self._cold[splat.id] = splat
-            else:
-                self._ram[splat.id] = splat
+        with self._lock:
+            for splat in splats:
+                if to_cold:
+                    self._cold[splat.id] = splat
+                else:
+                    self._ram[splat.id] = splat
 
-            self._access_count[splat.id] = 0
+                self._access_count[splat.id] = 0
 
-        self._stats.total_splats = len(self._cold) + len(self._ram) + len(self._vram)
+            self._stats.total_splats = len(self._cold) + len(self._ram) + len(self._vram)
 
     def get_splat(self, splat_id: int) -> Optional[GaussianSplat]:
         """
@@ -112,38 +117,34 @@ class SplatMemoryManager:
             GaussianSplat or None if not found
         """
         # Update access tracking
-        self._access_count[splat_id] = self._access_count.get(splat_id, 0) + 1
+        with self._lock:
+            self._access_count[splat_id] = self._access_count.get(splat_id, 0) + 1
 
-        # Check VRAM (hot)
-        if splat_id in self._vram:
-            self._stats.cache_hits += 1
-            # Move to end (most recently used)
-            self._vram.move_to_end(splat_id)
-            return self._vram[splat_id]
+            # Check VRAM (hot)
+            if splat_id in self._vram:
+                self._stats.cache_hits += 1
+                self._vram.move_to_end(splat_id)
+                return self._vram[splat_id]
 
-        # Check RAM (warm)
-        if splat_id in self._ram:
-            self._stats.cache_hits += 1
-            splat = self._ram[splat_id]
-            self._ram.move_to_end(splat_id)
+            # Check RAM (warm)
+            if splat_id in self._ram:
+                self._stats.cache_hits += 1
+                splat = self._ram[splat_id]
+                self._ram.move_to_end(splat_id)
 
-            # Promote to VRAM if frequently accessed
-            if self._access_count[splat_id] >= self.access_threshold:
-                self._promote_to_vram(splat_id)
+                if self._access_count[splat_id] >= self.access_threshold:
+                    self._promote_to_vram(splat_id)
 
-            return splat
+                return splat
 
-        # Load from cold storage
-        if splat_id in self._cold:
-            self._stats.cache_misses += 1
-            splat = self._cold[splat_id]
+            # Load from cold storage
+            if splat_id in self._cold:
+                self._stats.cache_misses += 1
+                splat = self._cold[splat_id]
+                self._load_to_ram(splat_id)
+                return splat
 
-            # Load to RAM
-            self._load_to_ram(splat_id)
-
-            return splat
-
-        return None
+            return None
 
     def _promote_to_vram(self, splat_id: int) -> None:
         """Promote splat from RAM to VRAM."""
