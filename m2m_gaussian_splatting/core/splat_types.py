@@ -53,9 +53,12 @@ class GaussianSplat:
         self.scale = np.asarray(self.scale, dtype=np.float32)
         self.rotation = np.asarray(self.rotation, dtype=np.float32)
 
-        # Normalize quaternion
+        # Normalize quaternion; fall back to identity for degenerate or
+        # NaN input (a zero quaternion silently produced identity covariance)
         norm = np.linalg.norm(self.rotation)
-        if norm > 0:
+        if not np.isfinite(norm) or norm < 1e-12:
+            self.rotation = np.array([1, 0, 0, 0], dtype=np.float32)
+        else:
             self.rotation = self.rotation / norm
 
     @property
@@ -151,7 +154,7 @@ class SplatEmbedding:
         """
         return np.concatenate(
             [self.position_encoding, self.color_encoding, self.attribute_encoding]
-        )
+        ).astype(np.float32, copy=False)
 
     @property
     def embedding_dim(self) -> int:
@@ -176,7 +179,9 @@ class SplatCluster:
     id: int
     centroid: np.ndarray
     splat_ids: list = field(default_factory=list)
-    bounds: tuple = field(default_factory=lambda: (np.zeros(3), np.zeros(3)))
+    bounds: tuple = field(
+        default_factory=lambda: (np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32))
+    )
 
     @property
     def size(self) -> int:

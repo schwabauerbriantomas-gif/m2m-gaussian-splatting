@@ -6,8 +6,8 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from time import time
-from src.core.hrm2_engine import HRM2Engine, generate_test_splats
-from src.gpu import HAS_CUDA, get_gpu_info
+from m2m_gaussian_splatting.core.hrm2_engine import HRM2Engine, generate_test_splats
+from m2m_gaussian_splatting.gpu import HAS_CUDA, get_gpu_info
 
 print(f"GPU available: {HAS_CUDA}")
 if HAS_CUDA:

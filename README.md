@@ -74,17 +74,28 @@ print(f"Device: {engine.get_stats().device}")  # "cuda" or "cpu"
 
 ## Performance
 
-**Benchmark environment:** AMD Ryzen 5 3400G, NVIDIA RTX 3090 (24GB), Python 3.12, PyTorch 2.6 + CUDA 12.4. 640D embeddings, k=10, 50 queries, p50 latency.
+### CPU (hierarchical IVF path) — v2.1
+
+**Benchmark environment:** AMD Ryzen 5 3400G (8 threads, CPU-only), Python 3.12.3, NumPy 2.5.3, Numba 0.68. 640D embeddings, k=10, 50 queries, mean latency. Measured with `scripts/run_benchmarks.py`; raw JSON with full metadata: `benchmark_results_cpu.json`.
+
+| Splats | HRM2 query | vs linear | Build |
+|--------|-----------|-----------|-------|
+| 1,000 | 0.54 ms | 2.7x | 0.22 s |
+| 10,000 | 2.30 ms | 9.0x | 2.00 s |
+| 50,000 | 7.01 ms | 13.5x | 4.25 s |
+
+Recall@10 = 100% at every size. Compared to v2.0.0 on the same machine and seeds: build **3.8x-35.4x faster** (50k: 150.5s → 4.25s), query **2.4x-6.7x faster** (50k: 47.0ms → 7.0ms) — lazy fine clustering, BLAS-GEMM cluster assignment, parallel numba kernels, CSR query layout.
+
+### GPU (brute-force path) — v2.0.0 measurements
+
+**Environment:** NVIDIA RTX 3090 (24GB), Python 3.12, PyTorch 2.6 + CUDA 12.4. Not re-measured in v2.1 (no CUDA in the audit environment); the GPU K-Means update loop was vectorized since then, so GPU build times below are expected to improve.
 
 | Splats | CPU p50 | GPU p50 | Speedup | CPU Build | GPU Build | GPU QPS |
 |--------|---------|---------|---------|-----------|-----------|---------|
-| 1,000 | 0.89 ms | 0.91 ms | 1.0x | 1.5 s | 1.5 s | 981 |
 | 10,000 | 8.22 ms | 1.12 ms | **7.3x** | 28.0 s | 2.1 s | 831 |
 | 50,000 | 49.76 ms | 3.64 ms | **13.7x** | 156.7 s | 7.4 s | 236 |
 
-GPU brute-force search dominates at scale: single-tensor upload, batched `torch.topk`, no clustering overhead. CPU uses the hierarchical IVF path with Numba-JIT K-Means.
-
-> These results are measured locally with `scripts/benchmark_gpu.py`. Raw JSON: `benchmark_results.json`.
+GPU brute-force search dominates at scale: single-tensor upload, batched `torch.topk`, no clustering overhead.
 
 ---
 
@@ -150,11 +161,11 @@ Query Batch (B × 640D)
 
 ```
 m2m-gaussian-splatting/
-├── src/
+├── m2m_gaussian_splatting/
 │   ├── core/
 │   │   ├── splat_types.py       # GaussianSplat, SplatEmbedding dataclasses
 │   │   ├── encoding.py          # Numba JIT encoders (position, color, attribute)
-│   │   ├── clustering.py        # K-Means++ + Mini-batch (Numba)
+│   │   ├── clustering.py        # K-Means++ + Mini-batch (BLAS GEMM + Numba)
 │   │   └── hrm2_engine.py       # HRM2 hierarchical index + GPU dispatch
 │   ├── gpu/
 │   │   ├── backend.py           # CUDA detection, device info
@@ -163,7 +174,7 @@ m2m-gaussian-splatting/
 │   └── memory/
 │       └── manager.py           # Three-tier LRU memory (thread-safe)
 ├── tests/
-│   └── test_core.py             # 36 tests (CPU + GPU + regression)
+│   └── test_core.py             # 58 tests (CPU + GPU + v2.1 regression)
 ├── scripts/
 │   ├── quick_demo.py            # Interactive demo
 │   ├── run_benchmarks.py        # CPU HRM2 vs linear
@@ -222,12 +233,14 @@ memory = SplatMemoryManager(
     vram_limit=100000,         # Hot tier (max splats)
     ram_limit=1000000,         # Warm tier
     eviction_threshold=0.8,    # Evict at 80% capacity
-    access_threshold=10,       # Promote to VRAM after N accesses
+    access_threshold=10,       # Promote to hot tier after N accesses
 )
 
 memory.add_splats(splats)
 splat = memory.get_splat(splat_id)  # Thread-safe, auto-promotes
 ```
+
+Note: tiers are recency tiers over in-process dicts — there is no CUDA or disk backing. Eviction never loses data (warm evictions return to cold storage) and tiers are exclusive (each splat lives in exactly one tier).
 
 ---
 
@@ -243,18 +256,18 @@ splat = memory.get_splat(splat_id)  # Thread-safe, auto-promotes
 ## Testing
 
 ```bash
-# Run full test suite (36 tests)
+# Run full test suite (58 tests)
 python -m pytest tests/ -v
 
 # With coverage
-python -m pytest tests/ --cov=src
+python -m pytest tests/ --cov=m2m_gaussian_splatting
 
 # Run benchmarks
 python scripts/benchmark_gpu.py    # GPU vs CPU
 python scripts/run_benchmarks.py   # HRM2 vs linear
 ```
 
-Tests cover: GPU recall against CPU ground truth, K-Means convergence, encoding edge cases (dim truncation, color normalization), thread safety (8-thread concurrent access), LRU eviction, serialization, and global RNG isolation.
+Tests cover: GPU recall against CPU ground truth, K-Means convergence, encoding edge cases (single point, empty input, NaN rejection, color spaces), thread safety (8-thread concurrent access), LRU eviction with no data loss, index save/load round-trip, float64 norm overflow, and global RNG isolation.
 
 ---
 
@@ -265,10 +278,10 @@ Tests cover: GPU recall against CPU ground truth, K-Means convergence, encoding 
 NeRF-style multi-frequency sinusoidal encoding applied per-axis (x, y, z):
 
 ```
-PE(axis, freq_i) = [sin(axis_norm · 2^i), cos(axis_norm · 2^i)]
+PE(axis, freq_i) = [sin(π · 2^i · axis_norm), cos(π · 2^i · axis_norm)]
 ```
 
-where `axis_norm` normalizes each coordinate to [0, 1] using dataset min/max. Output is `n_freq × 6` columns (sin/cos for x, y, z per frequency), zero-padded to exactly 64D.
+where `axis_norm` normalizes each coordinate to [0, 1] using scene bounds. Output is `n_freq × 6` columns (sin/cos for x, y, z per frequency), zero-padded to exactly 64D. Pass explicit `bounds` (or call `fit()`) for batch-independent, query-consistent encodings — by default normalization uses each batch's min/max, which makes single-point queries inconsistent with a batch-indexed base (legacy behavior kept for compatibility).
 
 ### Color Encoding (512D)
 
@@ -277,13 +290,17 @@ Histogram-based with Gaussian kernel smoothing:
 - 8 bins per RGB channel → 8³ = 512 total dimensions
 - Only evaluates bins within radius 2 of the target (125 vs 512 iterations per splat)
 - Gaussian kernel `exp(-d²/4)` decays below 0.37 at d=2
+- Output rows are L2-normalized (corner colors otherwise get a smaller norm and bias L2 search)
+- `color_space='01' | '255'` overrides the legacy batch-max auto-detection, which misclassifies dark [0,255] scenes
 
 ### K-Means
 
 - **K-Means++ initialization** with running min-distance array (O(N·K·D), not O(N·K²·D))
-- **Mini-batch updates** with learning-rate decay `η = 1/count`
-- Numba `@njit(fastmath=True)` on CPU, PyTorch CUDA on GPU
-- OOM recovery: GPU init falls back to CPU automatically
+- **Assignment via BLAS GEMM** (Gram trick `‖x‖² - 2x·c + ‖c‖²`) instead of scalar loops
+- **Mini-batch updates** with learning-rate decay `η = 1/count`, `tol` early stopping, and dead-cluster reseeding
+- Numba `@njit(parallel=True)` kernels on CPU, PyTorch CUDA (fully vectorized, no per-cluster syncs) on GPU
+- NaN/Inf input rejected explicitly (previously collapsed the clustering silently)
+- OOM recovery: GPU init frees the cache and falls back to CPU automatically
 
 ---
 

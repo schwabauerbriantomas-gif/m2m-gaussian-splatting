@@ -22,10 +22,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install package
-        run: pip install -e ".[dev]"
+        # [gpu] installs CPU torch so the torch-backed code paths are
+        # exercised in CI instead of silently skipped
+        run: pip install -e ".[dev,gpu]"
+
+      - name: Verify packaged import name
+        run: python -c "import m2m_gaussian_splatting as m; print(m.__version__)"
 
       - name: Check formatting (black)
-        run: black --check src/ tests/ scripts/
+        run: black --check m2m_gaussian_splatting/ tests/ scripts/
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ -v --tb=short --cov=m2m_gaussian_splatting --cov-report=term
+
+      - name: Upload coverage report
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          if-no-files-found: ignore

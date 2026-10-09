@@ -1,16 +1,4 @@
-# Core dependencies (required)
-numpy>=1.24.0
-numba>=0.58.0
-
-# API (optional — pip install -r requirements.txt"[api]")
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-pydantic>=2.5.0
-
-# Testing
-pytest>=7.4.0
-pytest-cov>=4.1.0
-
-# Utils (optional)
-tqdm>=4.66.0
-psutil>=5.9.0
+# Dependencies live in pyproject.toml (single source of truth).
+# Convenience wrapper: pip install -r requirements.txt
+# GPU extras: pip install -e ".[dev,gpu]"
+-e .[dev]

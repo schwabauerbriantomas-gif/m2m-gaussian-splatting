@@ -17,10 +17,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from time import time
 
-from src.core.splat_types import GaussianSplat
-from src.core.encoding import FullEmbeddingBuilder
-from src.core.hrm2_engine import HRM2Engine, generate_test_splats
-from src.memory.manager import SplatMemoryManager
+from m2m_gaussian_splatting.core.splat_types import GaussianSplat
+from m2m_gaussian_splatting.core.encoding import FullEmbeddingBuilder
+from m2m_gaussian_splatting.core.hrm2_engine import HRM2Engine, generate_test_splats
+from m2m_gaussian_splatting.memory.manager import SplatMemoryManager
 
 
 def main():
@@ -104,16 +104,18 @@ def main():
     memory = SplatMemoryManager(vram_limit=1000, ram_limit=5000)
     memory.add_splats(splats[:10000])
 
-    print(f"  Added {len(splats):,} splats")
+    print(f"  Added {len(splats):,} splats (cold storage)")
 
-    # Access some splats
-    for i in range(100):
-        memory.get_splat(i)
+    # Repeatedly access the same splats to trigger promotion to the hot tier
+    for _ in range(memory.access_threshold + 1):
+        for i in range(10):
+            memory.get_splat(i)
 
     mem_stats = memory.get_stats()
+    print(f"  Total splats: {mem_stats.total_splats:,}")
     print(f"  Cache hits: {mem_stats.cache_hits}")
-    print(f"  VRAM: {mem_stats.vram_usage:,}")
-    print(f"  RAM: {mem_stats.ram_usage:,}")
+    print(f"  Hot tier ('VRAM'): {mem_stats.vram_usage:,}")
+    print(f"  Warm tier ('RAM'): {mem_stats.ram_usage:,}")
     print()
 
     # Summary

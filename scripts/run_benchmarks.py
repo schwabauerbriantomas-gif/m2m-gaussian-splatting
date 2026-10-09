@@ -7,6 +7,9 @@ Compares HRM2 hierarchical search against brute-force linear search.
 
 import sys
 import os
+import json
+import platform
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,8 +17,8 @@ import numpy as np
 from time import time
 from typing import List, Tuple
 
-from src.core.splat_types import GaussianSplat
-from src.core.hrm2_engine import HRM2Engine, generate_test_splats
+from m2m_gaussian_splatting.core.splat_types import GaussianSplat
+from m2m_gaussian_splatting.core.hrm2_engine import HRM2Engine, generate_test_splats
 
 
 def linear_search(
@@ -48,7 +51,7 @@ def run_benchmark(n_splats: int, n_queries: int = 50) -> dict:
     scales = np.array([s.scale for s in splats])
     rotations = np.array([s.rotation for s in splats])
 
-    from src.core.encoding import FullEmbeddingBuilder
+    from m2m_gaussian_splatting.core.encoding import FullEmbeddingBuilder
 
     encoder = FullEmbeddingBuilder()
     embeddings = encoder.build(positions, colors, opacities, scales, rotations)
@@ -66,8 +69,8 @@ def run_benchmark(n_splats: int, n_queries: int = 50) -> dict:
     hrm2_times = []
     recalls = []
 
-    np.random.seed(123)
-    query_indices = np.random.choice(n_splats, n_queries, replace=False)
+    np_random = np.random.RandomState(123)
+    query_indices = np_random.choice(n_splats, n_queries, replace=False)
 
     for idx in query_indices:
         query = embeddings[idx]
@@ -95,7 +98,7 @@ def run_benchmark(n_splats: int, n_queries: int = 50) -> dict:
         "linear_std_ms": np.std(linear_times) * 1000,
         "hrm2_avg_ms": np.mean(hrm2_times) * 1000,
         "hrm2_std_ms": np.std(hrm2_times) * 1000,
-        "speedup": np.mean(linear_times) / np.mean(hrm2_times),
+        "speedup": np.mean(linear_times) / max(np.mean(hrm2_times), 1e-9),
         "recall": np.mean(recalls),
     }
 
@@ -145,11 +148,39 @@ def main():
     print("=" * 70)
     print()
 
-    print("Key observations:")
-    print(f"  - Build time scales linearly with dataset size")
-    print(f"  - Query time remains nearly constant due to hierarchical pruning")
-    print(f"  - Speedup increases with dataset size")
-    print(f"  - Recall remains high (>90%) across all sizes")
+    print("Key observations (computed from the measured results above):")
+    print()
+
+    ns = np.array([r["n_splats"] for r in results])
+    builds = np.array([r["build_time"] for r in results])
+    hrm2_ms = np.array([r["hrm2_avg_ms"] for r in results])
+    recalls_arr = np.array([r["recall"] for r in results])
+
+    # Build scaling: slope of log-log fit (≈1 linear, ≈2 quadratic)
+    if len(results) >= 2:
+        slope = np.polyfit(np.log(ns), np.log(builds), 1)[0]
+        scaling = (
+            "linear"
+            if slope < 1.3
+            else "quadratic" if slope > 1.7 else f"superlinear (exponent {slope:.2f})"
+        )
+        print(f"  - Build time scales {scaling} (log-log slope {slope:.2f})")
+
+        q_growth = hrm2_ms[-1] / hrm2_ms[0]
+        print(
+            f"  - Query time grew {q_growth:.1f}x from {ns[0]:,} to {ns[-1]:,} splats "
+            f"({hrm2_ms[0]:.2f}ms → {hrm2_ms[-1]:.2f}ms)"
+        )
+
+        sp = np.array([r["speedup"] for r in results])
+        trend = "increases" if sp[-1] > sp[0] else "decreases" if sp[-1] < sp[0] else "is flat"
+        print(f"  - Speedup {trend} with dataset size ({sp[0]:.1f}x → {sp[-1]:.1f}x)")
+
+    min_recall = recalls_arr.min()
+    if min_recall > 0.9:
+        print(f"  - Recall stays above 90% at all sizes (min {min_recall:.2%})")
+    else:
+        print(f"  - WARNING: recall dropped below 90% (min {min_recall:.2%})")
     print()
 
     max_speedup = max(r["speedup"] for r in results)
@@ -157,6 +188,22 @@ def main():
 
     print(f"Maximum speedup: {max_speedup:.1f}x")
     print(f"Average recall: {avg_recall:.2%}")
+    print()
+
+    # Persist results with reproducibility metadata
+    out = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "processor": platform.processor(),
+        "numpy": np.__version__,
+        "config": {"n_queries": N_QUERIES, "k": 10, "dataset_sizes": DATASET_SIZES},
+        "results": results,
+    }
+    out_path = os.path.join(os.path.dirname(__file__), "..", "benchmark_results_cpu.json")
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2, default=float)
+    print(f"Results saved to {os.path.normpath(out_path)}")
     print()
 
     print("=" * 70)
