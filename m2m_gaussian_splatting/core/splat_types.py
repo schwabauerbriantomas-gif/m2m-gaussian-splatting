@@ -6,6 +6,7 @@ Gaussian splats and their embeddings.
 """
 
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Optional, Dict, Any
 import numpy as np
 
@@ -53,15 +54,26 @@ class GaussianSplat:
         self.scale = np.asarray(self.scale, dtype=np.float32)
         self.rotation = np.asarray(self.rotation, dtype=np.float32)
 
-        # Normalize quaternion
+        # Normalize quaternion; fall back to identity for degenerate or
+        # NaN input (a zero quaternion silently produced identity covariance)
         norm = np.linalg.norm(self.rotation)
-        if norm > 0:
+        if not np.isfinite(norm) or norm < 1e-12:
+            self.rotation = np.array([1, 0, 0, 0], dtype=np.float32)
+        else:
             self.rotation = self.rotation / norm
 
-    @property
+    @cached_property
     def covariance_3d(self) -> np.ndarray:
         """
         Compute the 3D covariance matrix from scale and rotation.
+
+        The result is computed once and cached on the instance
+        (``functools.cached_property``; the dataclass is not frozen, and
+        the auto-generated ``__eq__`` compares field values, not
+        attributes, so the cache attribute is invisible to it). If
+        ``scale`` or ``rotation`` are mutated after the first access,
+        the stale cached matrix is returned — construct a new splat (or
+        delete ``covariance_3d`` from the instance) to recompute.
 
         Returns:
             3x3 covariance matrix
@@ -151,7 +163,7 @@ class SplatEmbedding:
         """
         return np.concatenate(
             [self.position_encoding, self.color_encoding, self.attribute_encoding]
-        )
+        ).astype(np.float32, copy=False)
 
     @property
     def embedding_dim(self) -> int:
@@ -176,7 +188,9 @@ class SplatCluster:
     id: int
     centroid: np.ndarray
     splat_ids: list = field(default_factory=list)
-    bounds: tuple = field(default_factory=lambda: (np.zeros(3), np.zeros(3)))
+    bounds: tuple = field(
+        default_factory=lambda: (np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32))
+    )
 
     @property
     def size(self) -> int:
@@ -184,7 +198,13 @@ class SplatCluster:
         return len(self.splat_ids)
 
     def contains_point(self, point: np.ndarray) -> bool:
-        """Check if a point is within the cluster bounds."""
+        """
+        Check if a point is within the cluster bounds.
+
+        Complexity: O(1) — a fixed number of coordinate comparisons
+        against the precomputed bounding box (3 per-axis checks for
+        ``>= min`` and 3 for ``<= max``), independent of cluster size.
+        """
         min_b, max_b = self.bounds
         return np.all(point >= min_b) and np.all(point <= max_b)
 
