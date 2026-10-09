@@ -19,7 +19,7 @@ M2M provides hierarchical retrieval and memory management for large-scale 3D Gau
 │                                                 ▼           │
 │                    ┌────────────────────────────────┐      │
 │                    │      Memory Manager            │      │
-│                    │  VRAM → RAM → Disk             │      │
+│                    │    Hot → Warm → Cold (host)    │      │
 │                    └────────────────────────────────┘      │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -45,9 +45,17 @@ M2M provides hierarchical retrieval and memory management for large-scale 3D Gau
 
 **Position Encoding (64D):**
 ```
-PE(pos, 2i) = sin(pos / 10000^(2i/dim))
-PE(pos, 2i+1) = cos(pos / 10000^(2i/dim))
+PE(pos, 2i)   = sin(pi · 2^i · pos)     i = 0..n_freq-1 (per axis)
+PE(pos, 2i+1) = cos(pi · 2^i · pos)
 ```
+The `pi` factor (NeRF-style) makes the lowest band a true half-wave over
+[0, 1]; without it the low bands are near-linear and waste dimensions.
+Positions are normalized to [0, 1] with scene bounds fixed once via
+`encoder.fit(positions)` (or an explicit `bounds` argument) so that
+indexing and querying agree — batch-wise normalization is the legacy
+default and is NOT recommended for vector search.
+Dimensions beyond 3 axes × 2·n_freq bands (e.g. 60-63 at dim=64) carry
+the top frequency band on the remaining axes instead of staying zero.
 
 **Color Encoding (512D):**
 - 8 bins per channel
@@ -96,16 +104,21 @@ Query Process:
 
 ### 5. Memory Manager (`manager.py`)
 
-**Three-Tier Memory:**
+**Three-Tier Memory (all host-side in v2.1.x):**
 
 | Tier | Storage | Access Time | Capacity |
 |------|---------|-------------|----------|
-| Hot | VRAM | <10μs | ~100K |
-| Warm | RAM | <1ms | ~1M |
-| Cold | Disk | <10ms | Unlimited |
+| Hot | host dict (hottest) | <1μs | ~100K |
+| Warm | host dict | <1ms | ~1M |
+| Cold | host dict (coldest) | <1ms | RAM-bound |
+
+Note: tiers are logical (dicts in host RAM); they are NOT CUDA/disk tiers.
+The guarantee that matters: eviction never loses data — splats evicted
+from the hot tier move to cold, and every splat lives in exactly one tier.
 
 **Eviction Policy:**
-- LRU (Least Recently Used)
+- LRU (Least Recently Used) with second chance: victims at ≥70% of
+  `access_threshold` are promoted instead of evicted
 - Promotion based on access count
 
 ## Performance
@@ -138,13 +151,18 @@ Where:
 ### 1. Numba JIT
 
 ```python
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, parallel=True)
 def compute_distances(data, centroids):
     # Parallel loop
     for i in prange(N):
         # Fast math operations
         ...
 ```
+
+Note: `parallel=True` is required for `prange` to actually run in
+parallel (it silently runs serial otherwise). Distance computations on
+the assignment step use BLAS GEMM via the Gram trick
+(`‖x‖² − 2x·c + ‖c‖²`) rather than scalar loops.
 
 ### 2. Dynamic Clustering
 
@@ -161,16 +179,25 @@ n_fine = min(default_n_fine, cluster_size // 5)
 ## Limitations
 
 1. **Approximate Search**: Not guaranteed to find exact nearest neighbors
-2. **Memory Bound**: Embeddings must fit in RAM
-3. **CPU Only**: No GPU acceleration (yet)
+2. **Memory Bound**: Embeddings must fit in host RAM
+3. **CPU-First**: GPU acceleration exists (`TorchKMeans`, `GPUSearcher`
+   via torch) but CUDA paths are not re-benchmarked as of v2.1.x
 4. **Single Machine**: No distributed processing
+5. **Memory Tiers Are Logical**: hot/warm/cold are host-side dicts, not
+   CUDA/disk tiers
+6. **Incremental Inserts Are Approximate**: `add_splats_incremental()`
+   does not re-cluster; use `index()` for canonical geometry
 
 ## Future Improvements
 
-1. **HNSW Integration**: Replace fine clustering with HNSW graphs
-2. **Product Quantization**: Reduce memory for embeddings
-3. **GPU Support**: CUDA kernels for encoding and clustering
-4. **Distributed**: Shard across multiple machines
+1. **Real GPU/Disk Tiers**: move the memory hierarchy to CUDA/disk storage
+2. **Product Quantization**: reduce memory for embeddings (not worth it
+   below ~1M vectors per external benchmarking)
+3. **CUDA Re-Benchmark**: measure GPU build/query and fp16 index on real
+   hardware
+4. **Incremental Re-Clustering Policy**: periodic rebalance of clusters
+   after incremental inserts
+5. **Distributed**: Shard across multiple machines
 
 ## References
 

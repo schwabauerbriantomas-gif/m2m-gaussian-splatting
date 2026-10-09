@@ -178,7 +178,9 @@ m2m-gaussian-splatting/
 │       ├── run_benchmarks.py    # CPU HRM2 vs linear (entry point: m2m-benchmark)
 │       └── benchmark_gpu.py     # GPU vs CPU comparison + recall check
 ├── tests/
-│   └── test_core.py             # 58 tests (CPU + GPU + v2.1 regression)
+│   ├── test_core.py             # 70 tests (CPU + GPU + v2.1/v2.1.1 regression)
+│   ├── test_persistence.py      # save/load round-trips (4 tests)
+│   └── test_edges.py            # edge-case contracts (8 tests)
 ├── docs/
 │   └── ARCHITECTURE.md          # Architecture document
 ├── benchmark_results.json       # Measured results
@@ -256,7 +258,7 @@ Note: tiers are recency tiers over in-process dicts — there is no CUDA or disk
 ## Testing
 
 ```bash
-# Run full test suite (58 tests)
+# Run full test suite (70 tests)
 python -m pytest tests/ -v
 
 # With coverage

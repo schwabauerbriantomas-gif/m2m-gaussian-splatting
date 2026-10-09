@@ -1,5 +1,46 @@
 # Changelog
 
+## [v2.1.1] - 2026-10-09
+
+Second audit pass (swarm round 2) — closes the remaining findings from the
+October 2026 audit.
+
+### Added
+- `add_splats_incremental()`: appends new splats to a built index without a
+  full rebuild (approximate: assigns to existing coarse clusters; `index()`
+  remains the canonical rebuild path)
+- `HRM2Engine.from_config()` / `SplatMemoryManager.from_config()`: build
+  from `HRM2Config` / `MemoryConfig` dataclasses
+- Package exports `HRM2Config`, `MemoryConfig`, `MemoryStats`,
+  `KMeansResult`, `SearchResult`
+- Console entry points: `m2m-benchmark`, `m2m-demo` (scripts moved into the
+  package as `m2m_gaussian_splatting/scripts/`)
+- `benchmark_gpu.py` now reports recall vs CPU ground truth (1.00 measured
+  at 1k/10k/50k on CPU)
+- +12 tests: persistence round-trips and edge-case contracts (58 → 70)
+
+### Fixed
+- `load_index()` validates that the engine holds as many splats as the
+  index was built for — a mismatched load used to succeed and fail later
+  with an opaque `IndexError` at query time (now: actionable `ValueError`)
+- `kmeans_full()` exposes `return_n_iter=True` (4-tuple); `KMeans.n_iter_`
+  is now the real iteration count on the full path
+- All RNG sampling lives in wrappers with local `np.random.Generator` —
+  no global `np.random` state is consumed anywhere in the package
+- `splat_types.GaussianSplat.covariance_3d` is a cached property (was
+  recomputed on every access)
+- Dead columns 60-63 of the sinusoidal position encoding now carry the
+  top frequency band (previously always zero)
+
+### Optimized
+- Full-path k-means: initial centroids computed once and shared
+  (double k-means++ eliminated)
+- `TorchKMeans`: chunked final assignment (bounded 65536-row blocks, peak
+  memory independent of N) and optional `dtype="half"` index with fp32
+  accumulation; `use_gpu` / `dtype` are constructor options
+- Second-chance eviction: warm-tier splats at ≥70% of `access_threshold`
+  are promoted instead of evicted (bounded fallback keeps the RAM limit)
+
 ## [v2.1.0] - 2026-10-09
 
 ### Fixed — audit-driven correctness release
