@@ -3,19 +3,18 @@
 Run Benchmarks - M2M Gaussian Splatting
 
 Compares HRM2 hierarchical search against brute-force linear search.
+Entry point: m2m-benchmark
 """
 
-import sys
-import os
+import argparse
 import json
+import os
 import platform
 from datetime import datetime, timezone
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import numpy as np
 from time import time
 from typing import List, Tuple
+
+import numpy as np
 
 from m2m_gaussian_splatting.core.splat_types import GaussianSplat
 from m2m_gaussian_splatting.core.hrm2_engine import HRM2Engine, generate_test_splats
@@ -103,46 +102,8 @@ def run_benchmark(n_splats: int, n_queries: int = 50) -> dict:
     }
 
 
-def main():
-    print("=" * 70)
-    print("M2M GAUSSIAN SPLATTING - BENCHMARKS")
-    print("=" * 70)
-    print()
-
-    DATASET_SIZES = [1000, 5000, 10000, 25000, 50000]
-    N_QUERIES = 50
-
-    print(f"Configuration:")
-    print(f"  Queries per dataset: {N_QUERIES}")
-    print(f"  K (results): 10")
-    print()
-
-    print("-" * 70)
-    print(
-        f"{'Splats':>10} | {'Build (s)':>10} | {'Linear (ms)':>12} | {'HRM2 (ms)':>10} | {'Speedup':>8} | {'Recall':>6}"
-    )
-    print("-" * 70)
-
-    results = []
-
-    for n in DATASET_SIZES:
-        print(f"Running benchmark with {n:,} splats...", end="\r")
-        result = run_benchmark(n, N_QUERIES)
-        results.append(result)
-
-        print(
-            f"{result['n_splats']:>10,} | "
-            f"{result['build_time']:>10.2f} | "
-            f"{result['linear_avg_ms']:>12.2f} | "
-            f"{result['hrm2_avg_ms']:>10.2f} | "
-            f"{result['speedup']:>8.1f}x | "
-            f"{result['recall']:>6.2%}"
-        )
-
-    print("-" * 70)
-    print()
-
-    # Summary
+def print_summary(results: list) -> None:
+    """Print the computed key observations from measured results."""
     print("=" * 70)
     print("SUMMARY")
     print("=" * 70)
@@ -190,6 +151,67 @@ def main():
     print(f"Average recall: {avg_recall:.2%}")
     print()
 
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Benchmark HRM2 hierarchical search vs brute-force linear search."
+    )
+    parser.add_argument(
+        "--sizes",
+        type=int,
+        nargs="+",
+        default=[1000, 5000, 10000, 25000, 50000],
+        help="Dataset sizes (number of splats) to benchmark (default: 1000 5000 10000 25000 50000)",
+    )
+    parser.add_argument(
+        "--n-queries",
+        type=int,
+        default=50,
+        help="Queries per dataset (default: 50)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    print("=" * 70)
+    print("M2M GAUSSIAN SPLATTING - BENCHMARKS")
+    print("=" * 70)
+    print()
+
+    print(f"Configuration:")
+    print(f"  Queries per dataset: {args.n_queries}")
+    print(f"  K (results): 10")
+    print()
+
+    print("-" * 70)
+    print(
+        f"{'Splats':>10} | {'Build (s)':>10} | {'Linear (ms)':>12} | {'HRM2 (ms)':>10} | {'Speedup':>8} | {'Recall':>6}"
+    )
+    print("-" * 70)
+
+    results = []
+
+    for n in args.sizes:
+        print(f"Running benchmark with {n:,} splats...", end="\r")
+        result = run_benchmark(n, args.n_queries)
+        results.append(result)
+
+        print(
+            f"{result['n_splats']:>10,} | "
+            f"{result['build_time']:>10.2f} | "
+            f"{result['linear_avg_ms']:>12.2f} | "
+            f"{result['hrm2_avg_ms']:>10.2f} | "
+            f"{result['speedup']:>8.1f}x | "
+            f"{result['recall']:>6.2%}"
+        )
+
+    print("-" * 70)
+    print()
+
+    print_summary(results)
+
     # Persist results with reproducibility metadata
     out = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -197,10 +219,13 @@ def main():
         "platform": platform.platform(),
         "processor": platform.processor(),
         "numpy": np.__version__,
-        "config": {"n_queries": N_QUERIES, "k": 10, "dataset_sizes": DATASET_SIZES},
+        "config": {"n_queries": args.n_queries, "k": 10, "dataset_sizes": args.sizes},
         "results": results,
     }
-    out_path = os.path.join(os.path.dirname(__file__), "..", "benchmark_results_cpu.json")
+    out_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "benchmark_results_cpu.json",
+    )
     with open(out_path, "w") as f:
         json.dump(out, f, indent=2, default=float)
     print(f"Results saved to {os.path.normpath(out_path)}")

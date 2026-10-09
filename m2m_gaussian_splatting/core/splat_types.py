@@ -6,6 +6,7 @@ Gaussian splats and their embeddings.
 """
 
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Optional, Dict, Any
 import numpy as np
 
@@ -61,10 +62,18 @@ class GaussianSplat:
         else:
             self.rotation = self.rotation / norm
 
-    @property
+    @cached_property
     def covariance_3d(self) -> np.ndarray:
         """
         Compute the 3D covariance matrix from scale and rotation.
+
+        The result is computed once and cached on the instance
+        (``functools.cached_property``; the dataclass is not frozen, and
+        the auto-generated ``__eq__`` compares field values, not
+        attributes, so the cache attribute is invisible to it). If
+        ``scale`` or ``rotation`` are mutated after the first access,
+        the stale cached matrix is returned — construct a new splat (or
+        delete ``covariance_3d`` from the instance) to recompute.
 
         Returns:
             3x3 covariance matrix
@@ -189,7 +198,13 @@ class SplatCluster:
         return len(self.splat_ids)
 
     def contains_point(self, point: np.ndarray) -> bool:
-        """Check if a point is within the cluster bounds."""
+        """
+        Check if a point is within the cluster bounds.
+
+        Complexity: O(1) — a fixed number of coordinate comparisons
+        against the precomputed bounding box (3 per-axis checks for
+        ``>= min`` and 3 for ``<= max``), independent of cluster size.
+        """
         min_b, max_b = self.bounds
         return np.all(point >= min_b) and np.all(point <= max_b)
 

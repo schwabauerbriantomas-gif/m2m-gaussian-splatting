@@ -10,8 +10,9 @@ __author__ = "Brian Schwabauer"
 
 from .core.splat_types import GaussianSplat, SplatEmbedding
 from .core.encoding import SinusoidalPositionEncoder, ColorHistogramEncoder
-from .core.hrm2_engine import HRM2Engine
-from .memory.manager import SplatMemoryManager
+from .core.clustering import KMeansResult
+from .core.hrm2_engine import HRM2Engine, HRM2Config, SearchResult
+from .memory.manager import SplatMemoryManager, MemoryConfig, MemoryStats
 from .gpu import detect_device, HAS_CUDA
 
 __all__ = [
@@ -19,8 +20,13 @@ __all__ = [
     "SplatEmbedding",
     "SinusoidalPositionEncoder",
     "ColorHistogramEncoder",
+    "KMeansResult",
     "HRM2Engine",
+    "HRM2Config",
+    "SearchResult",
     "SplatMemoryManager",
+    "MemoryConfig",
+    "MemoryStats",
     "detect_device",
     "HAS_CUDA",
 ]

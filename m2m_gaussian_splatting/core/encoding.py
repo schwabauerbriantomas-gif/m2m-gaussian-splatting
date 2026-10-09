@@ -26,6 +26,11 @@ v2.1 (audit 2026-10) changes:
   bounds (or call ``fit``) for query-time consistency. Frequencies now
   include the standard π factor (sin(π·2^d·x), NeRF-style); the old
   no-π scheme left the lowest bands nearly linear.
+- Position encoding dead columns: when ``dim % 6 > 0`` the trailing
+  columns are no longer zero-padded. For the default ``dim=64`` the
+  4 leftover columns (60-63) now carry the next frequency ``2^10``:
+  60-61 = sin/cos on x, 62 = sin on y, 63 = sin on z (audit finding
+  "columns 60-63 always zero").
 - Attribute encoder: opacities are clipped to [0,1], scales clamped to
   a small positive minimum and NaNs sanitized, preventing NaN/~1e8
   ratio features from contaminating the index.
@@ -77,7 +82,12 @@ def _sinusoidal_position_encoding_numba(
 
     Args:
         positions: (N, 3) array of 3D positions
-        dim: Output dimension (must be divisible by 6)
+        dim: Output dimension. ``dim // 6`` frequencies fill the first
+            ``dim // 6 * 6`` columns with (sin,cos) per axis; any remaining
+            columns (``dim % 6``, at most 5) are filled with the next
+            frequency ``2^n_freq`` applied to the axes in the fixed order
+            x-sin, x-cos, y-sin, z-sin, y-cos — so no output column is
+            ever dead (always-zero).
         min_x..max_z: normalization bounds
         use_pi: 1 to use the standard π·2^d frequencies, 0 for legacy 2^d
 
@@ -92,6 +102,7 @@ def _sinusoidal_position_encoding_numba(
     range_z = max_z - min_z + 1e-8
 
     n_freq = dim // 6
+    leftover = dim - n_freq * 6  # 0..5 columns not covered by full freqs
     pi = 3.141592653589793
     base = pi if use_pi == 1 else 1.0
 
@@ -111,6 +122,25 @@ def _sinusoidal_position_encoding_numba(
             encodings[i, idx + 3] = np.cos(y * freq)
             encodings[i, idx + 4] = np.sin(z * freq)
             encodings[i, idx + 5] = np.cos(z * freq)
+
+        # Leftover columns (dim % 6): use the next frequency (2^n_freq)
+        # on the axes in a fixed order so every column carries signal.
+        # For the default dim=64 (10 full freqs, 4 leftover): col 60 =
+        # sin(x·f), 61 = cos(x·f), 62 = sin(y·f), 63 = sin(z·f), with
+        # f = 2^10 — previously these 4 columns were always zero.
+        if leftover > 0:
+            freq = base * (2.0**n_freq)
+            idx = n_freq * 6
+            if leftover > 0:
+                encodings[i, idx] = np.sin(x * freq)
+            if leftover > 1:
+                encodings[i, idx + 1] = np.cos(x * freq)
+            if leftover > 2:
+                encodings[i, idx + 2] = np.sin(y * freq)
+            if leftover > 3:
+                encodings[i, idx + 3] = np.sin(z * freq)
+            if leftover > 4:
+                encodings[i, idx + 4] = np.cos(y * freq)
 
     return encodings
 
@@ -135,6 +165,17 @@ class SinusoidalPositionEncoder:
 
     Similar to positional encoding in Transformers and NeRF.
 
+    Column layout (dim=64 default): the first ``dim // 6`` frequencies d
+    = 0..n_freq-1 fill columns ``d*6 .. d*6+5`` with
+    (sin x, cos x, sin y, cos y, sin z, cos z) at frequency ``π·2^d``.
+    When ``dim % 6 > 0`` the leftover columns are NOT zero-padded: they
+    use the next frequency ``2^n_freq`` applied to the axes in the fixed
+    order x-sin, x-cos, y-sin, z-sin, y-cos. For the contractual
+    ``dim=64`` (n_freq=10, 4 leftover) this means:
+    columns 60-61 = sin/cos of ``2^10`` on x, column 62 = sin on y,
+    column 63 = sin on z. Before the 2026-10 audit these trailing
+    columns were always zero ("dead columns") and carried no signal.
+
     By default, coordinates are normalized by the min/max of each batch,
     which makes an embedding depend on the whole batch (a single point
     always encodes to a constant). Call :meth:`fit` (or pass
@@ -152,9 +193,13 @@ class SinusoidalPositionEncoder:
         Initialize encoder.
 
         Args:
-            dim: Output dimension. Uses dim//6 frequencies of (sin,cos) per
-                 axis (x,y,z), filling dim//6*6 columns; remaining columns
-                 are zero-padded so the output is exactly ``dim`` dims.
+            dim: Output dimension, exactly ``dim`` columns. ``dim // 6``
+                 frequencies fill ``dim // 6 * 6`` columns; the remaining
+                 ``dim % 6`` columns reuse the next frequency ``2^n_freq``
+                 on the axes (x-sin, x-cos, y-sin, z-sin, y-cos) so no
+                 column is dead. Default 64: freqs 2^0..2^9 fully +
+                 cols 60-61 = sin/cos(2^10·x), 62 = sin(2^10·y),
+                 63 = sin(2^10·z).
             bounds: Optional fixed scene bounds
                     (min_x, max_x, min_y, max_y, min_z, max_z).
             use_pi_frequencies: Use standard sin(π·2^d·x) frequencies
@@ -278,6 +323,16 @@ class ColorHistogramEncoder:
     Output rows are L2-normalized: corner colors (black/white) touch
     fewer bins and would otherwise get a systematically smaller norm,
     biasing L2-based search against them.
+
+    L2 vs sum normalization: an alternative would be dividing by the
+    sum of active weights (L1). L2 is kept because it is the
+    contractual behavior — ``test_color_row_norms_uniform`` (and the
+    downstream index, which compares embeddings with Euclidean/L2
+    distance) asserts uniform L2 norms across rows. Sum-normalization
+    would rescale rows differently unless every row's active-weight sum
+    were identical, reintroducing exactly the corner bias this
+    normalization exists to remove, and would silently change every
+    previously indexed embedding.
     """
 
     def __init__(self, n_bins: int = 8, color_space: Optional[str] = None):

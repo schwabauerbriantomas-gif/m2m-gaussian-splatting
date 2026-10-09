@@ -30,7 +30,7 @@ jobs:
         run: python -c "import m2m_gaussian_splatting as m; print(m.__version__)"
 
       - name: Check formatting (black)
-        run: black --check m2m_gaussian_splatting/ tests/ scripts/
+        run: black --check m2m_gaussian_splatting/ tests/
 
       - name: Run tests
         run: pytest tests/ -v --tb=short --cov=m2m_gaussian_splatting --cov-report=term

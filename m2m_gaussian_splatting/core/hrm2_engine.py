@@ -26,6 +26,12 @@ v2.1 (audit 2026-10) changes:
   instead of a full single-query pipeline per row.
 - New: ``save_index`` / ``load_index`` persist the index (embeddings,
   coarse model, CSR layout) so expensive builds survive process restarts.
+- New: ``add_splats_incremental`` appends splats to an already-built
+  index without re-clustering (approximate — see its docstring);
+  ``index()`` remains the canonical full-rebuild path.
+- New: ``HRM2Engine.from_config(HRM2Config)`` alternative constructor.
+  The loose kwargs remain the primary API; ``from_config`` exists so the
+  ``HRM2Config`` dataclass is actually wired to the engine.
 """
 
 import logging
@@ -175,6 +181,33 @@ class HRM2Engine:
         self._fine_built = False
         self._stats = HRM2Stats(device=self._device)
 
+    @classmethod
+    def from_config(cls, config: HRM2Config) -> "HRM2Engine":
+        """
+        Build an engine from an :class:`HRM2Config` dataclass.
+
+        The loose ``__init__`` kwargs remain the primary API; this
+        classmethod makes the config dataclass a real (non-decorative)
+        way to construct the engine::
+
+            engine = HRM2Engine.from_config(HRM2Config(n_coarse=50))
+
+        Args:
+            config: HRM2Config with the engine parameters.
+
+        Returns:
+            A new HRM2Engine instance.
+        """
+        return cls(
+            n_coarse=config.n_coarse,
+            n_fine=config.n_fine,
+            embedding_dim=config.embedding_dim,
+            n_probe=config.n_probe,
+            batch_size=config.batch_size,
+            random_state=config.random_state,
+            use_gpu=config.use_gpu,
+        )
+
     # ------------------------------------------------------------------
     # Build
     # ------------------------------------------------------------------
@@ -234,6 +267,16 @@ class HRM2Engine:
         self.splats.extend(splats)
         self._is_indexed = False
 
+    @staticmethod
+    def _extract_attributes(splats: List[GaussianSplat]):
+        """Stack splat attributes into (positions, colors, opacities, scales, rotations)."""
+        positions = np.stack([s.position for s in splats]).astype(np.float32, copy=False)
+        colors = np.stack([s.color for s in splats]).astype(np.float32, copy=False)
+        opacities = np.fromiter((s.opacity for s in splats), dtype=np.float32)
+        scales = np.stack([s.scale for s in splats]).astype(np.float32, copy=False)
+        rotations = np.stack([s.rotation for s in splats]).astype(np.float32, copy=False)
+        return positions, colors, opacities, scales, rotations
+
     def index(self) -> float:
         """
         Build the hierarchical index.
@@ -247,11 +290,7 @@ class HRM2Engine:
             return 0.0
 
         # Vectorized attribute extraction
-        positions = np.stack([s.position for s in self.splats]).astype(np.float32, copy=False)
-        colors = np.stack([s.color for s in self.splats]).astype(np.float32, copy=False)
-        opacities = np.fromiter((s.opacity for s in self.splats), dtype=np.float32)
-        scales = np.stack([s.scale for s in self.splats]).astype(np.float32, copy=False)
-        rotations = np.stack([s.rotation for s in self.splats]).astype(np.float32, copy=False)
+        positions, colors, opacities, scales, rotations = self._extract_attributes(self.splats)
 
         self.embeddings = self.encoder.build(positions, colors, opacities, scales, rotations)
         self.embeddings = np.ascontiguousarray(self.embeddings.astype(np.float32))
@@ -318,6 +357,152 @@ class HRM2Engine:
         self._stats.device = self._device
 
         return self._stats.build_time
+
+    def add_splats_incremental(self, new_splats: List[GaussianSplat]) -> None:
+        """
+        Append splats to an already-built index WITHOUT re-clustering.
+
+        Only the new splats are encoded and assigned to the EXISTING
+        coarse clusters via ``coarse_model.predict``; the CSR layout,
+        norms and cluster memberships are extended in place. On success
+        the index remains immediately queryable, including the new
+        splats.
+
+        APPROXIMATE BY DESIGN — known limitations:
+
+        - **No re-clustering.** Coarse centroids are not recomputed, so
+          repeated incremental additions progressively unbalance the
+          clusters (a cluster may grow far beyond its original size,
+          degrading n_probe recall). Centroid drift is also ignored:
+          new splats are assigned to stale centroids.
+        - **Fine level is invalidated.** If fine (level-2) clusters were
+          built, they no longer cover the new members, so they are
+          discarded and rebuilt lazily on the next
+          ``query_with_details``.
+        - **Encoder consistency.** The position encoder normalizes per
+          batch by default, so a small incremental batch can embed
+          slightly differently than the same splats would inside a full
+          ``index()`` rebuild. Fit fixed bounds once via
+          ``engine.encoder.fit_positions(...)`` before ``index()`` if
+          incremental batches must embed consistently.
+
+        ``index()`` (full rebuild) remains the canonical path; use this
+        method only when a rebuild is too expensive and approximate
+        recall is acceptable.
+
+        Args:
+            new_splats: Splats to append (non-empty).
+
+        Raises:
+            RuntimeError: If the index has not been built yet, or the
+                new embeddings have a different dimensionality than the
+                indexed ones.
+        """
+        if not self._is_indexed or self.embeddings is None or self.coarse_model is None:
+            raise RuntimeError("Index not built. Call index() before add_splats_incremental().")
+        if not new_splats:
+            return
+
+        # Bind once: everything below operates on these locals
+        emb_old = self.embeddings
+        norms_old = self._emb_norms_sq
+        emb_sorted_old = self._emb_sorted
+        norms_sorted_old = self._norms_sorted
+        order_old = self._global_order
+        offsets_old = self._cluster_offsets
+        nonempty_old = self._cluster_nonempty
+        if (
+            norms_old is None
+            or emb_sorted_old is None
+            or norms_sorted_old is None
+            or order_old is None
+            or offsets_old is None
+            or nonempty_old is None
+        ):
+            raise RuntimeError("Index structures missing. Call index() first.")
+
+        n_old = len(self.splats)
+
+        # 1. Encode ONLY the new splats
+        positions, colors, opacities, scales, rotations = self._extract_attributes(new_splats)
+        new_emb = np.ascontiguousarray(
+            self.encoder.build(positions, colors, opacities, scales, rotations).astype(np.float32)
+        )
+        if new_emb.shape[1] != self.embedding_dim:
+            raise RuntimeError(
+                f"new splats embed to dim {new_emb.shape[1]}, "
+                f"index expects {self.embedding_dim}"
+            )
+
+        # 2. Assign to the EXISTING coarse clusters (no re-fit)
+        new_assign = np.asarray(self.coarse_model.predict(new_emb), dtype=np.int64).ravel()
+
+        # 3. Extend the per-cluster global-index map (np.concatenate)
+        n_coarse = len(self._cluster_indices)
+        new_by_cluster = [np.where(new_assign == cid)[0] for cid in range(n_coarse)]
+        new_counts = np.array([len(ix) for ix in new_by_cluster], dtype=np.int64)
+        for cid, member_rows in enumerate(new_by_cluster):
+            self._cluster_indices[cid] = np.concatenate(
+                [self._cluster_indices[cid], member_rows + n_old]
+            )
+
+        # 4. Extend the CSR layout. New members are appended directly
+        #    after their cluster's old block (piecewise concatenate of
+        #    embeddings/norms/order), and every later boundary shifts by
+        #    the new members accumulated before it.
+        rows_extra = np.concatenate(new_by_cluster)  # rows of new_emb, cluster-major
+        new_norms_sq = np.sum(new_emb.astype(np.float64) ** 2, axis=1)
+
+        emb_pieces = []
+        norm_pieces = []
+        order_pieces = []
+        for cid, member_rows in enumerate(new_by_cluster):
+            s, e = offsets_old[cid], offsets_old[cid + 1]
+            emb_pieces.append(emb_sorted_old[s:e])
+            norm_pieces.append(norms_sorted_old[s:e])
+            order_pieces.append(order_old[s:e])
+            if len(member_rows) > 0:
+                emb_pieces.append(new_emb[member_rows])
+                norm_pieces.append(new_norms_sq[member_rows])
+                order_pieces.append(member_rows + n_old)
+
+        self.embeddings = np.ascontiguousarray(np.vstack([emb_old, new_emb]))
+        self._emb_norms_sq = np.concatenate([norms_old, new_norms_sq])
+        self._emb_sorted = np.ascontiguousarray(np.vstack(emb_pieces))
+        self._norms_sorted = np.concatenate(norm_pieces)
+        self._global_order = np.concatenate(order_pieces)
+        # CSR offsets: [o0..oK] + [0, cumsum(new_counts)] — each old
+        # boundary shifts by the new members added before its cluster
+        self._cluster_offsets = offsets_old + np.concatenate(
+            [np.zeros(1, dtype=np.int64), np.cumsum(new_counts)]
+        )
+        self._cluster_nonempty = np.logical_or(nonempty_old, new_counts > 0)
+
+        # 5. Bookkeeping: splats, assignments, stats
+        self.splats.extend(new_splats)
+        self.coarse_assignments = np.concatenate([self.coarse_assignments, new_assign])
+        self._stats.n_splats = len(self.splats)
+
+        # 6. Fine level no longer covers the new members: discard it and
+        #    let _ensure_fine_clusters rebuild lazily on next use.
+        self.fine_models = {}
+        self.fine_assignments = {}
+        self._fine_built = False
+
+        # 7. GPU brute-force index must see the new rows: rebuild it
+        if self._gpu_enabled and self._gpu_searcher is not None:
+            try:
+                self._gpu_searcher = GPUSearcher(
+                    self.embeddings,
+                    device="cuda",
+                    max_batch_size=256,
+                )
+            except Exception:
+                logger.warning("GPU searcher rebuild failed, falling back to CPU IVF")
+                self._gpu_searcher = None
+                self._gpu_enabled = False
+                self._device = "cpu"
+                self._stats.device = "cpu"
 
     # ------------------------------------------------------------------
     # Query
@@ -627,6 +812,12 @@ class HRM2Engine:
         self._norms_sorted = np.ascontiguousarray(self._emb_norms_sq[self._global_order])
 
         self.splats = list(self.splats)
+        if len(self.splats) != self.embeddings.shape[0]:
+            raise ValueError(
+                f"cannot load index: it was built for {self.embeddings.shape[0]} splats "
+                f"but this engine holds {len(self.splats)} — add the same splats "
+                f"(same order) via add_splats() before load_index()"
+            )
         self._gpu_searcher = None
         self._gpu_enabled = False
         self._device = "cpu"

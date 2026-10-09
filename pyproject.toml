@@ -43,6 +43,10 @@ dev = [
     "black",
 ]
 
+[project.scripts]
+m2m-benchmark = "m2m_gaussian_splatting.scripts.run_benchmarks:main"
+m2m-demo = "m2m_gaussian_splatting.scripts.quick_demo:main"
+
 [project.urls]
 Repository = "https://github.com/schwabauerbriantomas-gif/m2m-gaussian-splatting"
 

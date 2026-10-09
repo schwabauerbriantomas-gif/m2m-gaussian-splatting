@@ -59,7 +59,7 @@
 - Cluster assignment switched from a scalar O(N·K·D) numba loop to BLAS
   GEMM (Gram trick); numba kernels with `prange` now declare
   `parallel=True` (previously prange silently degraded to serial).
-- Full sweep (1k-50k splats, `scripts/run_benchmarks.py`, same machine,
+- Full sweep (1k-50k splats, `m2m-benchmark` (`m2m_gaussian_splatting/scripts/run_benchmarks.py`), same machine,
   same seeds): build **3.8x-35.4x faster** (50k: 150.5s → 4.25s), query
   **2.4x-6.7x faster** (50k: 47.0ms → 7.0ms), recall@10 = 100% at every
   size. Query path uses a CSR cluster layout (views instead of per-query

@@ -16,12 +16,24 @@ v2.1 (audit 2026-10) changes:
   O(N) permutation per iteration), tracks centroid shift with ``tol``
   early stopping, returns ``(centroids, labels, inertia, n_iter)``, and
   reseeds never-updated (dead) clusters from the farthest points.
+- ``kmeans_full`` accepts ``initial_centroids`` (callers that already ran
+  k-means++ no longer pay for a second init) and an optional
+  ``return_n_iter=True`` flag that appends the iteration count to the
+  returned tuple (default 3-tuple unchanged).
+- ``KMeans.fit()`` computes k-means++ exactly once and feeds it to both
+  paths (mini-batch and full Lloyd's) — previously the full path
+  re-derived its own init inside ``kmeans_full``.
+- All randomness (k-means++ picks, mini-batch index sampling, dead-cluster
+  reseeds) lives in the Python wrappers around a local
+  ``numpy.random.Generator``; the ``njit`` kernels are deterministic and
+  receive precomputed indices/data only. No ``np.random.*`` global calls
+  remain in this module.
 - ``fit()`` rejects non-finite input (NaN/Inf would silently collapse
   every point into cluster 0).
 """
 
 import numpy as np
-from typing import Tuple, Optional, Union
+from typing import Tuple, Optional, Union, cast
 from dataclasses import dataclass
 
 try:
@@ -297,12 +309,13 @@ def kmeans_full(
     tol: float = 1e-4,
     random_state: Union[int, np.random.Generator] = 42,
     initial_centroids: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray, float]:
+    return_n_iter: bool = False,
+) -> Union[Tuple[np.ndarray, np.ndarray, float], Tuple[np.ndarray, np.ndarray, float, int]]:
     """
     Full (Lloyd's) K-Means.
 
     Args:
-        data: (N, D) array
+        data: (N, D) array of data points
         n_clusters: Number of clusters
         max_iter: Maximum iterations
         tol: Convergence tolerance on the total squared centroid shift
@@ -310,9 +323,13 @@ def kmeans_full(
         initial_centroids: Optional (K, D) starting centroids; computed with
             k-means++ when omitted (avoids double init work when the caller
             already has them).
+        return_n_iter: When True, return a 4-tuple
+            ``(centroids, labels, inertia, n_iter)`` instead of the
+            default 3-tuple.
 
     Returns:
-        Tuple of (centroids, labels, inertia)
+        Tuple of (centroids, labels, inertia) — plus ``n_iter`` when
+        ``return_n_iter=True``.
     """
     data = np.ascontiguousarray(data, dtype=np.float32)
     N, D = data.shape
@@ -355,6 +372,8 @@ def kmeans_full(
 
     labels, dist_sq = _assign_gemm(data, centroids)
     inertia = float(dist_sq[np.arange(N), labels].sum())
+    if return_n_iter:
+        return centroids, labels, inertia, n_iter
     return centroids, labels, inertia
 
 
@@ -444,20 +463,37 @@ class KMeans:
         rng = np.random.default_rng(self.random_state)
         n_clusters = min(self.n_clusters, data.shape[0])
 
+        # k-means++ is computed exactly once and shared by both paths —
+        # the full path used to re-derive its own init inside kmeans_full.
+        init = kmeans_plusplus_init(data, n_clusters, rng)
+
         if self.use_mini_batch:
             self.centroids_, self.labels_, self.inertia_, self.n_iter_ = mini_batch_kmeans(
                 data,
-                kmeans_plusplus_init(data, n_clusters, rng),
+                init,
                 self.batch_size,
                 self.max_iter,
                 self.tol,
                 rng,
             )
         else:
-            self.centroids_, self.labels_, self.inertia_ = kmeans_full(
-                data, n_clusters, self.max_iter, self.tol, rng
+            (
+                self.centroids_,
+                self.labels_,
+                self.inertia_,
+                self.n_iter_,
+            ) = cast(
+                Tuple[np.ndarray, np.ndarray, float, int],
+                kmeans_full(
+                    data,
+                    n_clusters,
+                    self.max_iter,
+                    self.tol,
+                    rng,
+                    initial_centroids=init,
+                    return_n_iter=True,
+                ),
             )
-            self.n_iter_ = -1  # Lloyd's loop does not expose iteration count
 
         return self
 

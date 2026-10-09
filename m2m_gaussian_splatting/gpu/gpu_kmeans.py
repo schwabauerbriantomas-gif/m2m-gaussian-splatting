@@ -17,16 +17,26 @@ v2.1 (audit 2026-10) changes:
 - Dead clusters (never updated, which the 1/counts rule freezes forever)
   are reseeded from the points farthest from their centroid before the
   final assignment.
+- The final assignment runs in chunks of 65536 rows accumulating into
+  pre-allocated label/distance buffers, so peak memory no longer
+  materializes a full (N, K) distance matrix (N*K*4 bytes for the labels
+  pass alone is bounded by the chunk, not N).
+- ``__init__`` accepts ``use_gpu`` (default True, current behavior) and
+  ``dtype`` (``'float32'`` default, or ``'half'`` to run the index in
+  fp16). Existing callers that pass neither see no change. ``dtype`` is
+  only applied on the torch path; importing torch stays optional
+  (guarded by try/except at module level).
 - Everything runs under ``torch.inference_mode()``; on the OOM fallback
   ``torch.cuda.empty_cache()`` runs before the CPU retry.
 - The CPU fallback is vectorized (reuses the JIT ``_sum_by_label``
-  kernel) and shares the same convergence/reseeding semantics.
+  kernel), uses a local ``np.random.Generator`` (no global-RNG state),
+  and shares the same convergence/reseeding semantics.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from typing import Optional
+from typing import Optional, Tuple
 
 from .backend import HAS_TORCH, HAS_CUDA
 
@@ -52,13 +62,36 @@ class TorchKMeans:
         tol: float = 1e-4,
         random_state: int = 42,
         device: Optional[str] = None,
+        use_gpu: bool = True,
+        dtype: str = "float32",
     ):
+        """
+        Args:
+            n_clusters: Number of clusters
+            max_iter: Maximum iterations
+            batch_size: Mini-batch size
+            tol: Early-stop tolerance on total squared centroid shift
+            random_state: Random seed
+            device: Explicit device override ('cuda'/'cpu'). When None,
+                autodetects (cuda if available).
+            use_gpu: When False, force the CPU path regardless of device
+                detection. Defaults True (previous behavior).
+            dtype: Compute dtype for the torch path — 'float32' (default)
+                or 'half' (fp16, halves index memory). Ignored on CPU.
+        """
+        if dtype not in ("float32", "half"):
+            raise ValueError(f"dtype must be 'float32' or 'half', got {dtype!r}")
+
         self.n_clusters = n_clusters
         self.max_iter = max_iter
         self.batch_size = batch_size
         self.tol = tol
         self.random_state = random_state
-        self._device = device or ("cuda" if HAS_CUDA else "cpu")
+        self.dtype = dtype
+        if not use_gpu:
+            self._device = "cpu"
+        else:
+            self._device = device or ("cuda" if HAS_CUDA else "cpu")
 
         self.centroids_: Optional[np.ndarray] = None
         self.labels_: Optional[np.ndarray] = None
@@ -120,6 +153,11 @@ class TorchKMeans:
             device = torch.device(self._device)
 
             data_t = torch.from_numpy(data_np).to(device)
+            if self.dtype == "half":
+                # Halve the stored index (N·D·2 bytes). Distance math is
+                # upcast to fp32 inside _pairwise_sq, so accuracy holds;
+                # only the resident index pays the fp16 discount.
+                data_t = data_t.half()
             N, D = data_t.shape
 
             centroids_t = self._kpp_init_gpu(data_t, n_clusters, device)
@@ -141,7 +179,11 @@ class TorchKMeans:
 
                 # Vectorized mini-batch update: per-cluster sums/counts in
                 # ~4 kernels instead of a Python loop over clusters.
-                sums = torch.zeros_like(centroids_t).index_add_(0, labels, batch)
+                # Sums accumulate in fp32 even in half mode (index_add_
+                # on fp16 loses precision across a 10k-row batch).
+                sums = torch.zeros(
+                    centroids_t.shape, dtype=torch.float32, device=device
+                ).index_add_(0, labels, batch.float())
                 bcounts = torch.bincount(labels, minlength=n_clusters).to(torch.float32)
                 updated = bcounts > 0
                 ever_updated |= updated
@@ -150,41 +192,66 @@ class TorchKMeans:
 
                 eta = 1.0 / (counts[updated] + bcounts[updated])
                 new_centroids = centroids_t.clone()
-                new_centroids[updated] = (1.0 - eta.unsqueeze(1)) * centroids_t[
-                    updated
-                ] + eta.unsqueeze(1) * (sums[updated] / bcounts[updated].unsqueeze(1))
+                new_centroids[updated] = (
+                    (1.0 - eta.unsqueeze(1)) * centroids_t[updated].float()
+                    + eta.unsqueeze(1) * (sums[updated] / bcounts[updated].unsqueeze(1))
+                ).to(centroids_t.dtype)
                 counts[updated] += bcounts[updated]
 
-                shift = float((new_centroids - centroids_t).pow(2).sum().item())
+                # fp32 shift (fp16 differences underflow to 0 → false stop)
+                shift = float((new_centroids.float() - centroids_t.float()).pow(2).sum().item())
                 centroids_t = new_centroids
 
                 if shift < self.tol:
                     break
 
-            # Final assignment
-            all_dists = self._pairwise_sq(data_t, centroids_t)
-            all_labels = torch.argmin(all_dists, dim=1)
+            # Final assignment — chunked so a full (N, K) distance matrix
+            # is never materialized. Peak extra memory: one (chunk, K)
+            # fp32 block (65536*K*4 bytes) + two (N,) buffers.
+            all_labels, point_d = self._assign_chunked_gpu(data_t, centroids_t)
 
             # Reseed never-updated (dead) clusters from the farthest points
             dead = ~ever_updated
             n_dead = int(dead.sum().item())
             if n_dead > 0 and N > n_clusters:
-                point_d = all_dists.gather(1, all_labels.unsqueeze(1)).squeeze(1)
                 far = torch.topk(point_d, n_dead, largest=True).indices
                 centroids_t[dead] = data_t[far]
-                all_dists = self._pairwise_sq(data_t, centroids_t)
-                all_labels = torch.argmin(all_dists, dim=1)
+                all_labels, point_d = self._assign_chunked_gpu(data_t, centroids_t)
 
-            self.centroids_ = centroids_t.cpu().numpy()
+            self.centroids_ = centroids_t.float().cpu().numpy()
             self.labels_ = all_labels.cpu().numpy().astype(np.int32)
-            self.inertia_ = float(all_dists.gather(1, all_labels.unsqueeze(1)).sum().item())
+            self.inertia_ = float(point_d.sum().item())
             self.n_iter_ = n_iter
 
-            del data_t, centroids_t, all_dists, all_labels
+            del data_t, centroids_t, all_labels, point_d
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
         return self
+
+    _ASSIGN_CHUNK = 65536  # rows per final-assignment block
+
+    def _assign_chunked_gpu(
+        self, data_t: "torch.Tensor", centroids_t: "torch.Tensor"
+    ) -> Tuple["torch.Tensor", "torch.Tensor"]:
+        """
+        Chunked nearest-centroid assignment.
+
+        Accumulates labels and per-point squared distances into
+        pre-allocated (N,) buffers, looping in row blocks of
+        ``_ASSIGN_CHUNK``. Memory for the distance block is
+        ``_ASSIGN_CHUNK * K * 4`` bytes regardless of N.
+        """
+        N = data_t.shape[0]
+        labels = torch.empty(N, dtype=torch.int64, device=data_t.device)
+        point_d = torch.empty(N, dtype=torch.float32, device=data_t.device)
+        for start in range(0, N, self._ASSIGN_CHUNK):
+            end = min(start + self._ASSIGN_CHUNK, N)
+            dists = self._pairwise_sq(data_t[start:end], centroids_t)  # (b, K)
+            chunk_labels = torch.argmin(dists, dim=1)
+            labels[start:end] = chunk_labels
+            point_d[start:end] = dists.gather(1, chunk_labels.unsqueeze(1)).squeeze(1)
+        return labels, point_d
 
     def _kpp_init_gpu(
         self, data_t: "torch.Tensor", k: int, device: "torch.device"
@@ -221,7 +288,7 @@ class TorchKMeans:
 
     def _fit_cpu(self, data_np: np.ndarray, n_clusters: int) -> "TorchKMeans":
         """CPU fallback using vectorized NumPy (+ JIT per-cluster sums)."""
-        rng = np.random.RandomState(self.random_state)
+        rng = np.random.default_rng(self.random_state)
         centroids = self._kpp_init_cpu(data_np, n_clusters, rng)
 
         counts = np.ones(n_clusters, dtype=np.float64)
@@ -232,7 +299,7 @@ class TorchKMeans:
 
         for it in range(self.max_iter):
             n_iter = it + 1
-            idx = rng.randint(0, N, size=batch_size)
+            idx = rng.integers(0, N, size=batch_size)
             batch = np.ascontiguousarray(data_np[idx])
 
             labels = self._assign_batch(batch, centroids)
@@ -286,19 +353,27 @@ class TorchKMeans:
 
     @staticmethod
     def _pairwise_sq(a: "torch.Tensor", b: "torch.Tensor") -> "torch.Tensor":
-        """Squared L2 distance matrix via Gram trick."""
-        a_sq = (a**2).sum(dim=1, keepdim=True)  # (N,1)
-        b_sq = (b**2).sum(dim=1, keepdim=True).t()  # (1,K)
-        cross = a @ b.t()
+        """Squared L2 distance matrix via Gram trick.
+
+        Accumulates in float32 even when the index is stored in fp16
+        (``dtype='half'``): squared fp16 magnitudes overflow past ~65k,
+        so the norms and the output are always computed in fp32. Only
+        the stored index (N·D) stays half.
+        """
+        a32 = a.float()
+        b32 = b.float()
+        a_sq = (a32**2).sum(dim=1, keepdim=True)  # (N,1)
+        b_sq = (b32**2).sum(dim=1, keepdim=True).t()  # (1,K)
+        cross = a32 @ b32.t()
         return a_sq + b_sq - 2.0 * cross
 
     @staticmethod
-    def _kpp_init_cpu(data: np.ndarray, k: int, rng: np.random.RandomState) -> np.ndarray:
+    def _kpp_init_cpu(data: np.ndarray, k: int, rng: np.random.Generator) -> np.ndarray:
         """K-Means++ init on CPU with running min-distance."""
         N, D = data.shape
         centroids = np.zeros((k, D), dtype=np.float32)
 
-        idx = rng.randint(N)
+        idx = int(rng.integers(N))
         centroids[0] = data[idx]
 
         diff = data - centroids[0]
@@ -309,9 +384,12 @@ class TorchKMeans:
             probs = min_dist_sq / total
             if probs.sum() <= 0:
                 # Degenerate: all remaining points identical → random pick
-                idx = rng.randint(N)
+                idx = int(rng.integers(N))
             else:
-                idx = rng.choice(N, p=probs / probs.sum())
+                # Sample ∝ D² via inverse-CDF (same scheme as the JIT path)
+                r = rng.random() * float(probs.sum())
+                idx = int(np.searchsorted(np.cumsum(probs), r))
+                idx = min(idx, N - 1)
             centroids[i] = data[idx]
             diff = data - centroids[i]
             new_dist = np.sum(diff * diff, axis=1)

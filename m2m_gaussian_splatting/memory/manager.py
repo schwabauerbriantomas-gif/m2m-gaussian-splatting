@@ -21,6 +21,12 @@ v2.1 (audit 2026-10) changes:
   unknown IDs, and unknown-ID lookups count as cache misses.
 - Documented honestly: "VRAM" is a hot dict in host memory (no CUDA),
   "cold" is a dict in host memory (no disk). Tier names are conceptual.
+- Warm-tier eviction gives near-promotion splats a second chance: a
+  splat whose ``_access_count`` is at >= 70% of ``access_threshold``
+  is moved to the MRU end instead of being evicted. ``index``-style
+  LRU behavior is preserved for everything else.
+- New: ``SplatMemoryManager.from_config(MemoryConfig)`` alternative
+  constructor (loose kwargs remain the primary API).
 """
 
 from typing import Dict, List, Optional
@@ -111,6 +117,30 @@ class SplatMemoryManager:
 
         # Thread safety (RLock: get_splat → _promote_to_vram → _evict… reentrancy)
         self._lock = threading.RLock()
+
+    @classmethod
+    def from_config(cls, config: MemoryConfig) -> "SplatMemoryManager":
+        """
+        Build a manager from a :class:`MemoryConfig` dataclass.
+
+        The loose ``__init__`` kwargs remain the primary API; this
+        classmethod makes the config dataclass a real (non-decorative)
+        way to construct the manager::
+
+            manager = SplatMemoryManager.from_config(MemoryConfig(ram_limit=500))
+
+        Args:
+            config: MemoryConfig with the manager parameters.
+
+        Returns:
+            A new SplatMemoryManager instance.
+        """
+        return cls(
+            vram_limit=config.vram_limit,
+            ram_limit=config.ram_limit,
+            eviction_threshold=config.eviction_threshold,
+            access_threshold=config.access_threshold,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -250,6 +280,48 @@ class SplatMemoryManager:
         while len(self._ram) >= mark:
             self._evict_from_ram()
 
+    def _is_second_chance(self, splat_id: int) -> bool:
+        """
+        Second-chance rule: a warm splat whose access count is at or
+        above 70% of ``access_threshold`` is close to hot-tier
+        promotion — evicting it would throw away that progress. Such
+        splats are given another turn at the MRU end instead.
+        """
+        return self._access_count.get(splat_id, 0) >= 0.7 * self.access_threshold
+
+    def _pick_ram_eviction_candidate(self) -> Optional[int]:
+        """
+        Find the LRU warm splat that is NOT second-chance protected.
+
+        Protected splats encountered on the way (clock/second-chance)
+        receive ``move_to_end`` — they survive this round at the MRU end
+        but age normally, so a splat that stops being accessed loses
+        protection only through promotion (which removes it from the
+        warm tier) — never through decay. To keep eviction terminating
+        and the ram limit enforceable, the scan is bounded: if EVERY
+        warm splat is protected, the oldest protected one is evicted
+        anyway (a limit that can never be enforced is not a limit).
+        """
+        protected_seen: List[int] = []
+        candidate: Optional[int] = None
+        for splat_id in list(self._ram.keys()):  # front → back = LRU → MRU
+            if not self._is_second_chance(splat_id):
+                candidate = splat_id
+                break
+            protected_seen.append(splat_id)
+
+        # Second chance: skipped protected splats go to the MRU end
+        for sid in protected_seen:
+            self._ram.move_to_end(sid)
+
+        if candidate is not None:
+            return candidate
+        if protected_seen:
+            # All warm splats are protected: evict the LRU one so the
+            # while-loop in _maybe_evict_ram can make progress.
+            return protected_seen[0]
+        return None
+
     def _evict_from_vram(self) -> None:
         """Evict least recently used splat from hot tier — O(1) via OrderedDict."""
         if not self._vram:
@@ -271,10 +343,23 @@ class SplatMemoryManager:
 
         The splat is returned to cold storage (never dropped): this is the
         data-loss fix — RAM-only splats used to disappear permanently.
+
+        Second chance: before evicting, splats whose ``_access_count`` is
+        at >= 70% of ``access_threshold`` are moved to the MRU end and
+        skipped (they are one or two accesses away from hot-tier
+        promotion). The scan for an unprotected victim is bounded; if
+        every warm splat is protected, the LRU protected one is evicted
+        so the warm-tier limit stays enforceable.
         """
         if not self._ram:
             return
 
+        victim_id = self._pick_ram_eviction_candidate()
+        if victim_id is None:
+            return
+
+        # Move the victim to the FRONT so popitem(last=False) removes it
+        self._ram.move_to_end(victim_id, last=False)
         lru_id, lru_splat = self._ram.popitem(last=False)
         self._cold[lru_id] = lru_splat
         self._stats.evictions += 1

@@ -1,0 +1,162 @@
+#!/usr/bin/env python
+"""
+Quick Demo - M2M Gaussian Splatting
+
+Demonstrates basic usage of the M2M system:
+1. Creating Gaussian splats
+2. Building embeddings
+3. Indexing with HRM2
+4. Querying for similar splats
+5. Memory management
+
+Entry point: m2m-demo (--n-splats to control dataset size)
+"""
+
+import argparse
+from time import time
+
+import numpy as np
+
+from m2m_gaussian_splatting.core.encoding import FullEmbeddingBuilder
+from m2m_gaussian_splatting.core.hrm2_engine import HRM2Engine, generate_test_splats
+from m2m_gaussian_splatting.memory.manager import SplatMemoryManager
+
+
+def demo_embedding(splats):
+    """Build 640D embeddings from splat attributes. Returns (embeddings, elapsed_s)."""
+    start = time()
+
+    positions = np.array([s.position for s in splats])
+    colors = np.array([s.color for s in splats])
+    opacities = np.array([s.opacity for s in splats])
+    scales = np.array([s.scale for s in splats])
+    rotations = np.array([s.rotation for s in splats])
+
+    encoder = FullEmbeddingBuilder()
+    embeddings = encoder.build(positions, colors, opacities, scales, rotations)
+
+    return embeddings, time() - start
+
+
+def demo_index(splats, n_coarse, n_fine):
+    """Build the HRM2 hierarchical index. Returns (engine, build_time_s)."""
+    engine = HRM2Engine(n_coarse=n_coarse, n_fine=n_fine, n_probe=3)
+    engine.add_splats(splats)
+    build_time = engine.index()
+    return engine, build_time
+
+
+def demo_query(engine, embeddings, query_idx=0, k=10):
+    """Query the index for the k nearest splats to embeddings[query_idx]."""
+    query_embedding = embeddings[query_idx]
+    start = time()
+    results = engine.query(query_embedding, k=k)
+    return results, (time() - start) * 1000
+
+
+def demo_memory(splats):
+    """Run the three-tier memory manager demo. Returns the manager stats."""
+    memory = SplatMemoryManager(vram_limit=1000, ram_limit=5000)
+    memory.add_splats(splats[:10000])
+
+    # Repeatedly access the same splats to trigger promotion to the hot tier
+    for _ in range(memory.access_threshold + 1):
+        for i in range(10):
+            memory.get_splat(i)
+
+    return memory.get_stats()
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Quick demo of M2M Gaussian Splatting (splats → embeddings → HRM2 → query → memory)."
+    )
+    parser.add_argument(
+        "--n-splats",
+        type=int,
+        default=10000,
+        help="Number of splats to generate (default: 10000)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    N_SPLATS = args.n_splats
+    N_COARSE = 50
+    N_FINE = 200
+    K_RESULTS = 10
+
+    print("=" * 60)
+    print("M2M GAUSSIAN SPLATTING - QUICK DEMO")
+    print("=" * 60)
+    print()
+
+    print(f"Configuration:")
+    print(f"  Splats: {N_SPLATS:,}")
+    print(f"  Coarse clusters: {N_COARSE}")
+    print(f"  Fine clusters: {N_FINE}")
+    print()
+
+    # Step 1: Generate test splats
+    print("Step 1: Generating test splats...")
+    start = time()
+    splats = generate_test_splats(N_SPLATS, seed=42)
+    print(f"  Generated {len(splats):,} splats in {time()-start:.2f}s")
+    print()
+
+    # Step 2: Build embeddings
+    print("Step 2: Building embeddings...")
+    embeddings, elapsed = demo_embedding(splats)
+    print(f"  Embeddings shape: {embeddings.shape}")
+    print(f"  Build time: {elapsed:.2f}s")
+    print()
+
+    # Step 3: Index with HRM2
+    print("Step 3: Building HRM2 index...")
+    engine, build_time = demo_index(splats, N_COARSE, N_FINE)
+    print(f"  Index built in {build_time:.2f}s")
+
+    stats = engine.get_stats()
+    print(f"  Coarse clusters: {stats.n_coarse_clusters}")
+    print(f"  Fine clusters: {stats.n_fine_clusters}")
+    print()
+
+    # Step 4: Query for similar splats
+    print(f"Step 4: Querying for top {K_RESULTS} similar splats...")
+    results, query_ms = demo_query(engine, embeddings, query_idx=0, k=K_RESULTS)
+
+    print(f"  Query time: {query_ms:.2f}ms")
+    print(f"  Results:")
+
+    for i, (splat, dist) in enumerate(results):
+        print(f"    {i+1}. Splat {splat.id}: distance={dist:.4f}")
+    print()
+
+    # Step 5: Memory management demo
+    print("Step 5: Memory management demo...")
+    mem_stats = demo_memory(splats)
+
+    print(f"  Added {min(len(splats), 10000):,} splats (cold storage)")
+    print(f"  Total splats: {mem_stats.total_splats:,}")
+    print(f"  Cache hits: {mem_stats.cache_hits}")
+    print(f"  Hot tier ('VRAM'): {mem_stats.vram_usage:,}")
+    print(f"  Warm tier ('RAM'): {mem_stats.ram_usage:,}")
+    print()
+
+    # Summary
+    print("=" * 60)
+    print("DEMO COMPLETED SUCCESSFULLY")
+    print("=" * 60)
+    print()
+    print("Key features demonstrated:")
+    print("  ✓ Gaussian splat creation")
+    print("  ✓ 640D embedding generation")
+    print("  ✓ HRM2 hierarchical indexing")
+    print("  ✓ Fast similarity search")
+    print("  ✓ Memory management")
+
+
+if __name__ == "__main__":
+    main()

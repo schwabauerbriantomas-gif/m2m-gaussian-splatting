@@ -76,7 +76,7 @@ print(f"Device: {engine.get_stats().device}")  # "cuda" or "cpu"
 
 ### CPU (hierarchical IVF path) — v2.1
 
-**Benchmark environment:** AMD Ryzen 5 3400G (8 threads, CPU-only), Python 3.12.3, NumPy 2.5.3, Numba 0.68. 640D embeddings, k=10, 50 queries, mean latency. Measured with `scripts/run_benchmarks.py`; raw JSON with full metadata: `benchmark_results_cpu.json`.
+**Benchmark environment:** AMD Ryzen 5 3400G (8 threads, CPU-only), Python 3.12.3, NumPy 2.5.3, Numba 0.68. 640D embeddings, k=10, 50 queries, mean latency. Measured with `m2m-benchmark` (`m2m_gaussian_splatting/scripts/run_benchmarks.py`); raw JSON with full metadata: `benchmark_results_cpu.json`.
 
 | Splats | HRM2 query | vs linear | Build |
 |--------|-----------|-----------|-------|
@@ -171,14 +171,14 @@ m2m-gaussian-splatting/
 │   │   ├── backend.py           # CUDA detection, device info
 │   │   ├── gpu_kmeans.py        # GPU K-Means via PyTorch tensors
 │   │   └── gpu_search.py        # GPU brute-force k-NN search
-│   └── memory/
-│       └── manager.py           # Three-tier LRU memory (thread-safe)
+│   ├── memory/
+│   │   └── manager.py           # Three-tier LRU memory (thread-safe)
+│   └── scripts/
+│       ├── quick_demo.py        # Interactive demo (entry point: m2m-demo)
+│       ├── run_benchmarks.py    # CPU HRM2 vs linear (entry point: m2m-benchmark)
+│       └── benchmark_gpu.py     # GPU vs CPU comparison + recall check
 ├── tests/
 │   └── test_core.py             # 58 tests (CPU + GPU + v2.1 regression)
-├── scripts/
-│   ├── quick_demo.py            # Interactive demo
-│   ├── run_benchmarks.py        # CPU HRM2 vs linear
-│   └── benchmark_gpu.py         # GPU vs CPU comparison
 ├── docs/
 │   └── ARCHITECTURE.md          # Architecture document
 ├── benchmark_results.json       # Measured results
@@ -262,9 +262,10 @@ python -m pytest tests/ -v
 # With coverage
 python -m pytest tests/ --cov=m2m_gaussian_splatting
 
-# Run benchmarks
-python scripts/benchmark_gpu.py    # GPU vs CPU
-python scripts/run_benchmarks.py   # HRM2 vs linear
+# Run benchmarks (after `pip install -e .`)
+m2m-benchmark                      # HRM2 vs linear
+m2m-demo --n-splats 300            # Quick demo with a small dataset
+python -m m2m_gaussian_splatting.scripts.benchmark_gpu    # GPU vs CPU
 ```
 
 Tests cover: GPU recall against CPU ground truth, K-Means convergence, encoding edge cases (single point, empty input, NaN rejection, color spaces), thread safety (8-thread concurrent access), LRU eviction with no data loss, index save/load round-trip, float64 norm overflow, and global RNG isolation.
